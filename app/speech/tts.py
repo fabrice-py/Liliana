@@ -37,6 +37,11 @@ _SENTENCE_END_RE = re.compile(r"[.!?…]+[\"')\]]*(?=\s|$)|[\n\r]+")
 #: En deçà, on ne coupe pas : « Mr. », « 3.5 » ou « etc. » ne sont pas des phrases.
 _MIN_SENTENCE_CHARS = 15
 
+#: Une lettre ou un chiffre, dans n'importe quel alphabet. Un texte qui n'en
+#: contient aucun (« {} », « ... », « ??? ») ne produit aucun phonème : Piper
+#: écrit alors un WAV sans en-tête et `wave` lève une erreur illisible.
+_PRONOUNCEABLE_RE = re.compile(r"[^\W_]", re.UNICODE)
+
 
 class SentenceBuffer:
     """Découpe un texte qui arrive par fragments en phrases prononçables.
@@ -206,6 +211,13 @@ class PiperTTS(TTSProvider):
         except (AttributeError, TypeError) as exc:
             logger.debug("API Python Piper inattendue (%s), passage au binaire", exc)
             return None
+        except wave.Error as exc:
+            # Piper n'a écrit aucune trame : le fichier n'a même pas d'en-tête.
+            # Sans ce filet, l'erreur brute remonterait jusqu'au flux SSE.
+            raise TTSError(
+                f"piper produced no audio for {text!r}: {exc}",
+                user_message="Liliana had nothing to say out loud here.",
+            ) from exc
         finally:
             buffer.close()
 
@@ -240,6 +252,13 @@ class PiperTTS(TTSProvider):
         text = (text or "").strip()
         if not text:
             raise TTSError("nothing to synthesize", user_message="There was nothing to say.")
+        if not _PRONOUNCEABLE_RE.search(text):
+            # Arrive quand le modèle renvoie un fragment vide (« {} ») ou de la
+            # ponctuation seule. Ce n'est pas une panne : il n'y a rien à dire.
+            raise TTSError(
+                f"nothing pronounceable in {text!r}",
+                user_message="There was nothing to say.",
+            )
 
         model = self.voice_path(language)
         if model is None:
@@ -292,21 +311,26 @@ class PiperTTS(TTSProvider):
             has_python = False
         has_binary = self._binary() is not None
 
-        if not has_python and not has_binary:
-            return False, TTSUnavailableError.user_message
-
         voices = self.available_voices()
         missing = [name for name, present in voices.items() if not present]
-        engine = "python module" if has_python else "binary"
         incomplete = self.incomplete_voices()
 
+        # Un téléchargement interrompu est un problème distinct du moteur absent,
+        # et il se répare autrement : on le signale dans tous les cas, sinon
+        # l'utilisateur relance un téléchargement qui échouera de la même façon.
+        hint = (
+            "These voices are incomplete (the .onnx.json config is missing): "
+            f"{', '.join(incomplete)}. "
+            if incomplete
+            else ""
+        )
+
+        if not has_python and not has_binary:
+            return False, f"{TTSUnavailableError.user_message} {hint}".strip()
+
+        engine = "python module" if has_python else "binary"
+
         if not any(voices.values()):
-            hint = (
-                f"These voices are incomplete (the .onnx.json config is missing): "
-                f"{', '.join(incomplete)}. "
-                if incomplete
-                else ""
-            )
             return False, (
                 f"Piper ({engine}) is installed but no usable voice was found in "
                 f"{self.voices_dir}. {hint}Run `python scripts/download_voices.py`."

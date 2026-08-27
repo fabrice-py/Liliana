@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.language.languages import get_language
+from app.language.languages import CEFR_LEVELS, get_language
 
 # --------------------------------------------------------------- persona
 BASE_SYSTEM_PROMPT = """\
@@ -219,8 +219,21 @@ def _bullet_list(items: list[str], empty: str = "none yet") -> str:
     return "\n".join(f"- {item}" for item in items) if items else f"- {empty}"
 
 
-def build_system_prompt(context: TutorContext) -> str:
-    """Assemble le prompt système complet pour un tour de conversation."""
+def build_system_prompt(context: TutorContext, output_format: str = "") -> str:
+    """Assemble le prompt système complet pour un tour de conversation.
+
+    L'ordre des sections n'est pas cosmétique. Ollama met en cache le plus long
+    préfixe déjà évalué : tout ce qui suit le premier caractère qui change doit
+    être recalculé. Or le profil de l'apprenant — points faibles, erreurs
+    récentes, mots à réviser — change à chaque tour, tandis que la consigne de
+    base et le contrat de sortie ne bougent jamais.
+
+    Les parties stables viennent donc en tête, le profil en queue. Dans l'autre
+    sens, le contrat de sortie (plusieurs centaines de tokens) était ré-évalué à
+    chaque tour : une dizaine de secondes perdues sans GPU, à chaque phrase. Cet
+    ordre a de surcroît un mérite pédagogique — ce que le modèle lit en dernier
+    est ce dont il tient le plus compte.
+    """
     language = get_language(context.language)
     mode = get_mode(context.mode)
 
@@ -235,12 +248,12 @@ def build_system_prompt(context: TutorContext) -> str:
         for item in context.recent_errors[:6]
     ]
 
+    # --- invariant d'un tour à l'autre : reste dans le cache du modèle --------
     sections = [
         BASE_SYSTEM_PROMPT,
         "",
         "## Current context",
         f"Target language: {language.english_name} ({language.native_name})",
-        f"User CEFR level in this language: {context.level}",
         f"User's native language: {context.native_language}",
         f"Session mode: {mode.label}",
         "",
@@ -249,6 +262,18 @@ def build_system_prompt(context: TutorContext) -> str:
         "",
         "## " + correction_instruction(context.correction_mode).split(".")[0],
         correction_instruction(context.correction_mode),
+        "",
+        "## Error types you may use in the `errors` field",
+        ", ".join(language.error_types),
+    ]
+    if output_format:
+        sections += ["", "## Output format", output_format]
+
+    # --- change à chaque tour : seule cette queue est ré-évaluée --------------
+    sections += [
+        "",
+        "## This learner, right now",
+        f"User CEFR level in this language: {context.level}",
         "",
         "## Known weaknesses (weave practice for these into the conversation)",
         _bullet_list(weaknesses, "no weakness identified yet"),
@@ -268,11 +293,6 @@ def build_system_prompt(context: TutorContext) -> str:
     if context.session_summary:
         sections += ["", "## What happened earlier in this session", context.session_summary]
 
-    sections += [
-        "",
-        "## Error types you may use in the `errors` field",
-        ", ".join(language.error_types),
-    ]
     return "\n".join(sections)
 
 
@@ -314,9 +334,63 @@ Rules:
 """
 
 
+def _object(**properties: Any) -> dict[str, Any]:
+    """Objet JSON Schema dont tous les champs sont obligatoires.
+
+    Les rendre obligatoires est le but même de la manœuvre : c'est ce qui empêche
+    le modèle de « oublier » la correction et de la glisser dans sa réponse
+    parlée, où plus rien ne peut l'exploiter.
+    """
+    return {"type": "object", "properties": properties, "required": list(properties)}
+
+
+_STRING: dict[str, Any] = {"type": "string"}
+_LEVEL: dict[str, Any] = {"type": "string", "enum": list(CEFR_LEVELS)}
+
+#: Contrat de sortie d'un tour, en JSON Schema — le pendant exécutable de
+#: ``RESPONSE_SCHEMA_PROMPT``.
+#:
+#: Décrire le format en prose ne suffit pas. Un modèle de 3B comprend la
+#: consigne, trouve la bonne correction… et l'écrit dans ``response`` en laissant
+#: ``correction`` et ``errors`` vides : la carte Correction, les statistiques
+#: d'erreurs et la répétition espacée n'ont alors plus rien à exploiter. Transmis
+#: à Ollama via ``format``, ce schéma contraint le décodage lui-même — les champs
+#: ne peuvent plus manquer.
+#:
+#: ``response`` vient en tête, et cet ordre est structurant : les champs sont
+#: générés dans l'ordre du schéma, ce qui laisse ``ResponseStreamParser``
+#: commencer à parler avant que la correction ne soit écrite.
+TURN_RESPONSE_SCHEMA: dict[str, Any] = _object(
+    response=_STRING,
+    correction=_object(original=_STRING, corrected=_STRING, explanation=_STRING),
+    errors={
+        "type": "array",
+        "items": _object(
+            type=_STRING,
+            topic=_STRING,
+            original=_STRING,
+            corrected=_STRING,
+            severity={"type": "string", "enum": ["minor", "major"]},
+        ),
+    },
+    vocabulary={
+        "type": "array",
+        "items": _object(
+            word=_STRING, translation=_STRING, example=_STRING, difficulty=_LEVEL
+        ),
+    },
+    detected_language={
+        "type": "string",
+        "enum": ["english", "german", "french", "other"],
+    },
+    difficulty=_LEVEL,
+    suggested_level=_LEVEL,
+)
+
+
 def build_turn_prompt(context: TutorContext) -> str:
     """Prompt système + contrat de sortie JSON."""
-    return f"{build_system_prompt(context)}\n\n## Output format\n{RESPONSE_SCHEMA_PROMPT}"
+    return build_system_prompt(context, output_format=RESPONSE_SCHEMA_PROMPT)
 
 
 # --------------------------------------------------- prompts spécialisés

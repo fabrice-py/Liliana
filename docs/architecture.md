@@ -66,8 +66,10 @@ Three abstract interfaces isolate the machine-learning parts:
 
 ```python
 class LLMProvider:   # app/ai/llm.py
-    def generate(self, messages, *, temperature=None, json_mode=False) -> str: ...
-    def stream(self, messages, *, temperature=None) -> Iterator[str]: ...
+    def generate(self, messages, *, temperature=None, json_mode=False,
+                 schema=None) -> str: ...
+    def stream(self, messages, *, temperature=None, json_mode=False,
+               schema=None) -> Iterator[str]: ...
     def status(self) -> LLMStatus: ...
 
 class STTProvider:   # app/speech/stt.py
@@ -97,6 +99,8 @@ has a defined behaviour:
 | espeak-ng missing | Pronunciation scored on spelling instead of sounds, and says so |
 | `LLM_MODEL` not set | The best installed Ollama model is chosen and reported |
 | Model returns broken JSON | Raw text is used as the spoken answer, no correction |
+| Model returns an empty envelope (`{}`) | Refused as an answer, never stored — it would be imitated at every later turn |
+| Server too old for schema-constrained output | Falls back to `format: json`, logged once |
 | Stream breaks mid-answer | An `error` event closes it; the browser retries without streaming |
 | Silent recording | HTTP 422, "Liliana did not hear anything" |
 | Microphone denied | Explains browser *and* OS permissions |

@@ -170,6 +170,162 @@ def test_connection_failure_becomes_unavailable(monkeypatch) -> None:
         provider.generate([{"role": "user", "content": "hi"}])
 
 
+def test_the_model_is_asked_to_stay_in_memory(monkeypatch) -> None:
+    """Sans `keep_alive`, Ollama decharge le modele apres 5 min d'inactivite.
+
+    Le rechargement coute plusieurs dizaines de secondes sans GPU : c'est ce qui
+    rendait la reprise apres une pause si lente.
+    """
+    monkeypatch.setenv("LLM_MODEL", "some-model")
+    monkeypatch.setenv("LLM_KEEP_ALIVE", "45m")
+    provider = OllamaProvider(reload_settings())
+    sent: dict = {}
+
+    def _capture(self, url, **kwargs):  # noqa: ANN001, ARG001
+        sent.update(kwargs.get("json") or {})
+        return httpx.Response(
+            200, json={"message": {"content": "ok"}}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx.Client, "post", _capture)
+    provider.generate([{"role": "user", "content": "hi"}])
+    assert sent["keep_alive"] == "45m"
+
+
+# --------------------------------------------------------- sortie contrainte
+SCHEMA = {"type": "object", "properties": {"response": {"type": "string"}}}
+
+
+def _capturing(monkeypatch, status: int = 200):
+    """Remplace httpx.Client.post et retourne le dict des payloads envoyes."""
+    sent: list[dict] = []
+
+    def _post(self, url, **kwargs):  # noqa: ANN001, ARG001
+        sent.append(kwargs.get("json") or {})
+        request = httpx.Request("POST", url)
+        if status != 200 and len(sent) == 1:
+            return httpx.Response(status, text="format: unsupported value", request=request)
+        return httpx.Response(200, json={"message": {"content": "ok"}}, request=request)
+
+    monkeypatch.setattr(httpx.Client, "post", _post)
+    return sent
+
+
+def test_a_schema_constrains_the_output(monkeypatch) -> None:
+    """Demander le format en prose ne suffit pas : le schema part dans `format`."""
+    monkeypatch.setenv("LLM_MODEL", "some-model")
+    provider = OllamaProvider(reload_settings())
+    sent = _capturing(monkeypatch)
+
+    provider.generate([{"role": "user", "content": "hi"}], json_mode=True, schema=SCHEMA)
+
+    assert sent[0]["format"] == SCHEMA
+
+
+def test_without_a_schema_plain_json_mode_is_used(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_MODEL", "some-model")
+    provider = OllamaProvider(reload_settings())
+    sent = _capturing(monkeypatch)
+
+    provider.generate([{"role": "user", "content": "hi"}], json_mode=True)
+
+    assert sent[0]["format"] == "json"
+
+
+def test_a_server_refusing_schemas_falls_back_instead_of_failing(monkeypatch) -> None:
+    """Ollama < 0.5 rejette un `format` objet — la conversation doit continuer.
+
+    Le repli est moins fiable, jamais bloquant : c'est le modele de defaillance
+    du projet (docs/architecture.md).
+    """
+    monkeypatch.setenv("LLM_MODEL", "some-model")
+    provider = OllamaProvider(reload_settings())
+    sent = _capturing(monkeypatch, status=400)
+
+    answer = provider.generate(
+        [{"role": "user", "content": "hi"}], json_mode=True, schema=SCHEMA
+    )
+
+    assert answer == "ok"
+    assert sent[0]["format"] == SCHEMA          # premiere tentative
+    assert sent[1]["format"] == "json"          # repli
+    assert provider.supports_schema is False
+
+    # On ne retente pas : le refus est definitif pour ce serveur.
+    provider.generate([{"role": "user", "content": "again"}], json_mode=True, schema=SCHEMA)
+    assert sent[2]["format"] == "json"
+
+
+# ------------------------------------------------------- un modele par langue
+def test_each_language_can_get_its_own_model(monkeypatch) -> None:
+    """Le bon modele depend de la langue travaillee, pas de la machine.
+
+    Mesure a l'appui : sur ce contrat de sortie un 1.5B corrige l'anglais aussi
+    bien qu'un 3B et pres de trois fois plus vite, mais s'effondre sur les cas et
+    les genres allemands.
+    """
+    monkeypatch.setenv("LLM_MODEL", "default-model")
+    provider = OllamaProvider(reload_settings())
+    sent = _capturing(monkeypatch)
+
+    provider.generate([{"role": "user", "content": "hi"}], model="small-fast-model")
+    provider.generate([{"role": "user", "content": "hallo"}], model="big-accurate-model")
+    provider.generate([{"role": "user", "content": "hi"}])
+
+    assert [payload["model"] for payload in sent] == [
+        "small-fast-model",
+        "big-accurate-model",
+        "default-model",
+    ]
+
+
+def test_a_blank_per_language_model_falls_back_to_the_default(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_MODEL", "default-model")
+    provider = OllamaProvider(reload_settings())
+    sent = _capturing(monkeypatch)
+
+    provider.generate([{"role": "user", "content": "hi"}], model="   ")
+
+    assert sent[0]["model"] == "default-model"
+
+
+def test_settings_resolve_the_model_per_language(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_MODEL", "default-model")
+    monkeypatch.setenv("LLM_MODEL_ENGLISH", "small-fast-model")
+    settings = reload_settings()
+
+    assert settings.llm_model_for("english") == "small-fast-model"
+    assert settings.llm_model_for("german") == "default-model"   # non configure
+    assert settings.llm_model_for("klingon") == "default-model"
+    assert settings.languages_with_their_own_model() == {"english": "small-fast-model"}
+
+
+def test_a_language_model_that_is_not_installed_is_reported(monkeypatch) -> None:
+    """Sinon la panne n'apparait qu'en basculant vers cette langue, en pleine lecon."""
+    monkeypatch.setenv("LLM_MODEL", "qwen2.5:3b-instruct")
+    monkeypatch.setenv("LLM_MODEL_GERMAN", "a-model-nobody-pulled")
+    provider = OllamaProvider(reload_settings())
+
+    monkeypatch.setattr(
+        OllamaProvider, "_installed", lambda self: installed(("qwen2.5:3b-instruct", "3B"))
+    )
+
+    def _tags(self, url, **kwargs):  # noqa: ANN001, ARG001
+        return httpx.Response(
+            200,
+            json={"models": installed(("qwen2.5:3b-instruct", "3B"))},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(httpx.Client, "get", _tags)
+    status = provider.status()
+
+    assert status.available is False
+    assert "german" in status.detail
+    assert "a-model-nobody-pulled" in status.detail
+    assert status.models_by_language == {"german": "a-model-nobody-pulled"}
+
+
 def test_provider_instance_is_reused() -> None:
     reset_llm_provider()
     assert get_llm_provider() is get_llm_provider()

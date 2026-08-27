@@ -76,9 +76,11 @@ The conversation stays a conversation. The correction is recorded either way.
 - Adjustable speaking rate ("Liliana, speak more slowly").
 
 **Teaching**
-- Seven conversation modes: free conversation, just talk, English teacher,
+- Nine conversation modes: free conversation, just talk, English teacher,
   German teacher, immersion, grammar training, vocabulary training,
-  pronunciation training.
+  pronunciation training, and "teach me" — where you name a grammar point and
+  Liliana walks you through it: explanation, comprehension check, production,
+  correction, exercise.
 - Four correction levels: `off`, `minimal`, `normal`, `strict`.
 - A full error taxonomy, including German-specific categories (cases,
   der/die/das, verb position, separable verbs, adjective endings, Umlaut…).
@@ -94,7 +96,10 @@ The conversation stays a conversation. The correction is recorded either way.
 **Memory and progress**
 - A placement test on first launch, per language.
 - A learning profile with six skills, recomputed from your real data — never
-  hardcoded.
+  hardcoded. Five of them are measured directly (grammar and vocabulary from
+  your mistakes and drills, speaking and writing per channel, pronunciation from
+  your recorded attempts); listening has no direct signal yet and is estimated
+  from how much conversation you actually sustain.
 - SM-2 spaced repetition for both vocabulary and grammar points.
 - A dashboard: level, skills, study time, words learned, errors corrected,
   exercise success rate, weekly progression, what to work on next.
@@ -250,6 +255,21 @@ pronunciation practice compares words instead of sounds.
 
 No GPU is required anywhere. Everything runs on CPU, just more slowly.
 
+**A model per language.** Liliana asks the model for a strict JSON contract —
+answer, correction, error types — and constrains the decoding to it, so the model
+no longer has to be clever about *format*, only about the *language*. How much
+model that takes turns out to depend on which language: measured here, a
+`qwen2.5:1.5b-instruct` corrects English exactly as well as a 3B and roughly three
+times faster, but loses German cases and genders. If you alternate, say so:
+
+```bash
+LLM_MODEL_ENGLISH=qwen2.5:1.5b-instruct
+LLM_MODEL_GERMAN=qwen2.5:3b-instruct
+```
+
+Ollama keeps both loaded, so switching language costs nothing. Leave them empty
+and Liliana uses one model everywhere, as before.
+
 ---
 
 ## Configuration
@@ -260,6 +280,8 @@ through the code. The ones you are most likely to touch:
 | Variable | Default | What it does |
 |---|---|---|
 | `LLM_MODEL` | *(empty)* | Ollama model name. Leave empty to auto-select. |
+| `LLM_MODEL_ENGLISH` / `_GERMAN` | *(empty)* | A model per language — see below. Empty falls back to `LLM_MODEL`. |
+| `LLM_KEEP_ALIVE` | `30m` | How long Ollama keeps the model in memory between turns. |
 | `STT_MODEL` | `base` | Whisper size: `tiny`…`large-v3` |
 | `TTS_PROVIDER` | `piper` | `none` disables voice output entirely |
 | `DEFAULT_LANGUAGE` | `english` | `english` or `german` |

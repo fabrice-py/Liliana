@@ -106,3 +106,21 @@ def test_normalise_assessment_clamps_scores() -> None:
 def test_normalise_assessment_returns_none_when_empty() -> None:
     assert normalise_assessment({"summary": "nothing useful"}) is None
     assert normalise_assessment(None) is None
+
+
+@pytest.mark.parametrize("envelope", ["{}", "[]", "null", "  { }  ", "...", '""'])
+def test_an_empty_json_envelope_is_not_an_answer(envelope: str) -> None:
+    """« {} » n'est pas du texte libre : le parler ou l'enregistrer casse tout.
+
+    Enregistré comme message de l'assistant, il revient dans l'historique du tour
+    suivant et le modèle imite sa propre sortie vide — la session ne produit plus
+    que « {} ». Une réponse vide fait lever une erreur claire à l'appelant.
+    """
+    turn = normalise_turn(None, fallback_text=envelope)
+    assert turn["response"] == ""
+
+
+def test_free_text_is_still_used_as_the_answer() -> None:
+    """Le repli sur le texte brut reste la règle quand le modèle oublie le JSON."""
+    turn = normalise_turn(None, fallback_text="Sorry, I forgot the JSON.")
+    assert turn["response"] == "Sorry, I forgot the JSON."

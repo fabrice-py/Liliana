@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from app.ai.tutor import tutor
 from app.core.config import get_settings
-from app.core.exceptions import EmptyTranscriptionError, LilianaError, TTSError
+from app.core.exceptions import EmptyTranscriptionError, LilianaError
 from app.core.hardware import detect_hardware
 from app.core.logger import get_logger
 from app.database.repositories import (
@@ -82,8 +82,15 @@ def _speak(text: str, language: str, speed: float | None = None) -> dict[str, An
     garde le texte, l'application ne plante pas (cf. §36)."""
     try:
         speech = get_tts_provider().synthesize(text, language, speed=speed)
-    except (TTSError, LilianaError) as exc:
+    except LilianaError as exc:
         logger.info("TTS indisponible : %s", exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 - garde-fou volontairement large
+        # Cette fonction est la frontière derrière laquelle la voix a le droit
+        # d'échouer. Un moteur tiers (Piper, ONNX, wave) peut lever à peu près
+        # n'importe quoi ; aucune de ces erreurs ne doit interrompre un tour de
+        # conversation, encore moins couper un flux SSE en cours (cf. §36).
+        logger.warning("Erreur inattendue du moteur vocal : %s: %s", type(exc).__name__, exc)
         return None
     return {
         "audio_base64": base64.b64encode(speech.audio).decode("ascii"),
@@ -111,6 +118,19 @@ def _sse(event: str, data: dict[str, Any]) -> str:
 def _sse_error(exc: LilianaError) -> str:
     logger.warning("Flux interrompu — %s: %s", type(exc).__name__, exc)
     return _sse("error", {"error": type(exc).__name__, "message": exc.user_message})
+
+
+def _sse_unexpected(exc: Exception) -> str:
+    """Referme le flux sur une erreur imprévue.
+
+    Un flux SSE qui meurt sans rien dire laisse l'interface à attendre pour
+    toujours : le navigateur ne distingue pas une connexion coupée d'une réponse
+    lente. La doc (docs/architecture.md, « Failure model ») promet un évènement
+    ``error`` — il doit sortir même quand la cause est un bug, pas une panne
+    prévue. La trace complète part dans le journal, jamais dans l'interface.
+    """
+    logger.exception("Flux interrompu par une erreur imprévue — %s", type(exc).__name__)
+    return _sse("error", {"error": type(exc).__name__, "message": LilianaError.user_message})
 
 
 def _stream_turn(
@@ -270,6 +290,7 @@ def health() -> dict[str, Any]:
             "available": llm_status.available,
             "detail": llm_status.detail,
             "installed_models": list(llm_status.installed_models),
+            "models_by_language": llm_status.models_by_language,
         },
         "stt": {
             "provider": settings.stt_provider,
@@ -502,6 +523,8 @@ def chat_turn_stream(payload: TurnRequest) -> StreamingResponse:
             )
         except LilianaError as exc:
             yield _sse_error(exc)
+        except Exception as exc:  # noqa: BLE001 - le flux doit se refermer proprement
+            yield _sse_unexpected(exc)
 
     return StreamingResponse(events(), media_type="text/event-stream", headers=SSE_HEADERS)
 
@@ -559,6 +582,8 @@ async def voice_turn_stream(
             )
         except LilianaError as exc:
             yield _sse_error(exc)
+        except Exception as exc:  # noqa: BLE001 - le flux doit se refermer proprement
+            yield _sse_unexpected(exc)
 
     return StreamingResponse(events(), media_type="text/event-stream", headers=SSE_HEADERS)
 

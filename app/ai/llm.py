@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -89,6 +89,8 @@ class LLMStatus:
     model: str
     detail: str = ""
     installed_models: tuple[str, ...] = ()
+    #: Modèles imposés par langue, quand la configuration en désigne.
+    models_by_language: dict[str, str] = field(default_factory=dict)
 
 
 class LLMProvider(ABC):
@@ -103,8 +105,17 @@ class LLMProvider(ABC):
         *,
         temperature: float | None = None,
         json_mode: bool = False,
+        schema: dict[str, Any] | None = None,
+        model: str | None = None,
     ) -> str:
-        """Génère une réponse complète à partir d'un historique de messages."""
+        """Génère une réponse complète à partir d'un historique de messages.
+
+        ``schema`` (JSON Schema) contraint la forme de la sortie ; un backend qui
+        ne sait pas le faire doit l'ignorer et retomber sur ``json_mode``.
+
+        ``model`` impose un modèle pour cet appel, en lieu et place de celui de la
+        configuration : le bon modèle dépend de la langue travaillée.
+        """
 
     @abstractmethod
     def stream(
@@ -113,6 +124,8 @@ class LLMProvider(ABC):
         *,
         temperature: float | None = None,
         json_mode: bool = False,
+        schema: dict[str, Any] | None = None,
+        model: str | None = None,
     ) -> Iterator[str]:
         """Génère la réponse par fragments (pour réduire la latence perçue)."""
 
@@ -133,6 +146,10 @@ class OllamaProvider(LLMProvider):
         self.timeout = self.settings.llm_timeout
         #: Vrai quand le modèle a été choisi automatiquement faute de LLM_MODEL.
         self.auto_selected = False
+        #: Passe à False si le serveur refuse un `format` en JSON Schema (Ollama
+        #: < 0.5). On ne réessaie pas : le repli `format: json` reste correct,
+        #: simplement moins fiable.
+        self.supports_schema = True
 
     # -------------------------------------------------- sélection du modèle
     def _installed(self) -> list[dict[str, Any]]:
@@ -199,20 +216,42 @@ class OllamaProvider(LLMProvider):
         return self.model
 
     def _payload(
-        self, messages: list[dict[str, str]], temperature: float | None, json_mode: bool
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None,
+        json_mode: bool,
+        schema: dict[str, Any] | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "model": self._require_model(),
+            "model": (model or "").strip() or self._require_model(),
             "messages": messages,
+            "keep_alive": self.settings.llm_keep_alive,
             "options": {
                 "temperature": (
                     self.settings.llm_temperature if temperature is None else temperature
                 )
             },
         }
-        if json_mode:
+        if schema is not None and self.supports_schema:
+            # Contraint le décodage à la forme attendue : le modèle ne peut plus
+            # omettre un champ. Bien plus fiable que de le demander en prose.
+            payload["format"] = schema
+        elif json_mode:
             payload["format"] = "json"
         return payload
+
+    def _drop_schema_support(self, exc: httpx.HTTPStatusError) -> bool:
+        """Le serveur a-t-il rejeté le schéma ? Si oui, on n'en enverra plus."""
+        if not self.supports_schema or exc.response.status_code != 400:
+            return False
+        self.supports_schema = False
+        logger.warning(
+            "Ollama refuse un `format` en JSON Schema (%s) : repli sur `format: json`. "
+            "Une version >= 0.5 rend les corrections nettement plus fiables.",
+            exc.response.text[:200],
+        )
+        return True
 
     @staticmethod
     def _translate_http_error(exc: httpx.HTTPStatusError) -> LLMError:
@@ -228,8 +267,10 @@ class OllamaProvider(LLMProvider):
         *,
         temperature: float | None = None,
         json_mode: bool = False,
+        schema: dict[str, Any] | None = None,
+        model: str | None = None,
     ) -> str:
-        payload = self._payload(messages, temperature, json_mode)
+        payload = self._payload(messages, temperature, json_mode, schema, model)
         payload["stream"] = False
         try:
             with httpx.Client(timeout=self.timeout) as client:
@@ -237,6 +278,10 @@ class OllamaProvider(LLMProvider):
                 response.raise_for_status()
                 data = response.json()
         except httpx.HTTPStatusError as exc:
+            if self._drop_schema_support(exc):
+                return self.generate(
+                    messages, temperature=temperature, json_mode=True, model=model
+                )
             raise self._translate_http_error(exc) from exc
         except httpx.RequestError as exc:
             raise LLMUnavailableError(f"cannot reach Ollama at {self.base_url}: {exc}") from exc
@@ -254,29 +299,47 @@ class OllamaProvider(LLMProvider):
         *,
         temperature: float | None = None,
         json_mode: bool = False,
+        schema: dict[str, Any] | None = None,
+        model: str | None = None,
     ) -> Iterator[str]:
-        payload = self._payload(messages, temperature, json_mode)
-        payload["stream"] = True
         try:
-            with httpx.Client(timeout=self.timeout) as client:
-                with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as response:
-                    response.raise_for_status()
-                    for line in response.iter_lines():
-                        if not line:
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        piece = (chunk.get("message") or {}).get("content", "")
-                        if piece:
-                            yield piece
-                        if chunk.get("done"):
-                            break
+            yield from self._stream_once(messages, temperature, json_mode, schema, model)
         except httpx.HTTPStatusError as exc:
+            # Le rejet du schéma survient sur `raise_for_status()`, avant le
+            # moindre fragment : la reprise sans schéma est sans conséquence
+            # pour l'appelant, qui n'a encore rien reçu.
+            if self._drop_schema_support(exc):
+                yield from self._stream_once(messages, temperature, True, None, model)
+                return
             raise self._translate_http_error(exc) from exc
         except httpx.RequestError as exc:
             raise LLMUnavailableError(f"cannot reach Ollama at {self.base_url}: {exc}") from exc
+
+    def _stream_once(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None,
+        json_mode: bool,
+        schema: dict[str, Any] | None,
+        model: str | None = None,
+    ) -> Iterator[str]:
+        payload = self._payload(messages, temperature, json_mode, schema, model)
+        payload["stream"] = True
+        with httpx.Client(timeout=self.timeout) as client:
+            with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    piece = (chunk.get("message") or {}).get("content", "")
+                    if piece:
+                        yield piece
+                    if chunk.get("done"):
+                        break
 
     def status(self) -> LLMStatus:
         try:
@@ -307,20 +370,51 @@ class OllamaProvider(LLMProvider):
             )
         # Ollama tolère `llama3` pour `llama3:latest` : on compare sans le tag.
         base_names = {name.split(":", 1)[0] for name in installed}
-        if self.model not in installed and self.model.split(":", 1)[0] not in base_names:
+
+        def _is_installed(name: str) -> bool:
+            return name in installed or name.split(":", 1)[0] in base_names
+
+        per_language = self.settings.languages_with_their_own_model()
+
+        if not _is_installed(self.model):
             return LLMStatus(
                 available=False,
                 provider=self.name,
                 model=self.model,
                 detail=f"Model '{self.model}' is not installed. Run `ollama pull {self.model}`.",
                 installed_models=installed,
+                models_by_language=per_language,
             )
+
+        # Un modèle configuré pour une langue mais absent ne casserait que cette
+        # langue-là, et seulement au moment de parler : autant le dire tout de suite.
+        missing = {
+            language: name
+            for language, name in per_language.items()
+            if not _is_installed(name)
+        }
+        if missing:
+            details = ", ".join(f"{language} -> '{name}'" for language, name in missing.items())
+            return LLMStatus(
+                available=False,
+                provider=self.name,
+                model=self.model,
+                detail=(
+                    f"A model is configured for a language but not installed ({details}). "
+                    f"Run `ollama pull {next(iter(missing.values()))}`, or clear the setting "
+                    "to fall back to the default model."
+                ),
+                installed_models=installed,
+                models_by_language=per_language,
+            )
+
         return LLMStatus(
             available=True,
             provider=self.name,
             model=self.model,
             detail="auto-selected" if self.auto_selected else "ready",
             installed_models=installed,
+            models_by_language=per_language,
         )
 
 

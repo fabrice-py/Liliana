@@ -32,6 +32,10 @@ def isolated_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterat
     # la suite est donc déterministe quelle que soit la machine.
     for name in ("CORRECTION_MODE", "DEFAULT_LANGUAGE", "TTS_PROVIDER", "STT_MODEL"):
         monkeypatch.delenv(name, raising=False)
+    # Un modèle par langue configuré en local ne doit pas déteindre sur les tests :
+    # neutralisé ici, chaque test qui en a besoin le pose lui-même.
+    for language in ("ENGLISH", "GERMAN", "FRENCH"):
+        monkeypatch.setenv(f"LLM_MODEL_{language}", "")
     monkeypatch.setenv("CORRECTION_MODE", "normal")
     monkeypatch.setenv("DEFAULT_LANGUAGE", "english")
 
@@ -70,16 +74,24 @@ class FakeLLM(LLMProvider):
         self.responses = responses or ['{"response": "Hello!", "errors": []}']
         self.chunk_size = chunk_size
         self.calls: list[list[dict[str, str]]] = []
+        #: Schémas reçus, pour vérifier que le contrat est bien transmis.
+        self.schemas: list[dict | None] = []
+        #: Modèles demandés par appel — un par langue travaillée.
+        self.models: list[str | None] = []
 
-    def generate(self, messages, *, temperature=None, json_mode=False):  # noqa: ANN001
+    def generate(self, messages, *, temperature=None, json_mode=False, schema=None, model=None):  # noqa: ANN001
         self.calls.append(messages)
+        self.schemas.append(schema)
+        self.models.append(model)
         if len(self.responses) > 1:
             return self.responses.pop(0)
         return self.responses[0]
 
-    def stream(self, messages, *, temperature=None, json_mode=False):  # noqa: ANN001
+    def stream(self, messages, *, temperature=None, json_mode=False, schema=None, model=None):  # noqa: ANN001
         """Découpe la réponse en petits fragments, comme le ferait un vrai modèle."""
-        text = self.generate(messages, temperature=temperature, json_mode=json_mode)
+        text = self.generate(
+            messages, temperature=temperature, json_mode=json_mode, schema=schema, model=model
+        )
         size = max(1, self.chunk_size)
         for start in range(0, len(text), size):
             yield text[start : start + size]

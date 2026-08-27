@@ -350,6 +350,43 @@ def test_tts_outage_does_not_break_the_stream(client, monkeypatch) -> None:
     assert next(data for name, data in events if name == "done")["response"]
 
 
+def test_an_unexpected_tts_crash_does_not_break_the_stream(client, monkeypatch) -> None:
+    """Un moteur vocal tiers peut lever n'importe quoi — le tour doit survivre.
+
+    `wave.Error`, une erreur ONNX… aucune n'hérite de LilianaError. Avant le
+    garde-fou de `_speak()`, elles coupaient la connexion SSE en silence.
+    """
+    import wave
+
+    def _crash(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise wave.Error("# channels not specified")
+
+    monkeypatch.setattr(client.fake_tts, "synthesize", _crash)
+    client.fake_llm.responses = [TURN_JSON]
+    events = parse_sse(client.post("/api/chat/turn/stream", json={"text": "Hi"}).text)
+
+    assert "audio" not in kinds(events)
+    assert kinds(events)[-1] == "done"
+    assert next(data for name, data in events if name == "done")["response"]
+
+
+def test_an_unexpected_failure_still_closes_the_stream_with_an_error(client, monkeypatch) -> None:
+    """La doc promet un évènement `error` — y compris quand la cause est un bug.
+
+    Un flux qui meurt sans rien dire laisse l'interface attendre indéfiniment.
+    """
+    def _boom(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise RuntimeError("something nobody predicted")
+
+    monkeypatch.setattr("app.api.routes.tutor.respond_stream", _boom)
+    response = client.post("/api/chat/turn/stream", json={"text": "Hi"})
+    events = parse_sse(response.text)
+
+    assert kinds(events)[-1] == "error"
+    message = next(data for name, data in events if name == "error")["message"]
+    assert message and "something nobody predicted" not in message  # jamais la trace
+
+
 # ------------------------------------------------------------- voix en flux
 def test_voice_stream_emits_transcription_then_answer(client) -> None:
     client.fake_llm.responses = [TURN_JSON]

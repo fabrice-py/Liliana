@@ -177,6 +177,29 @@ def test_system_prompt_injects_the_learner_context() -> None:
     assert "separable_verbs" in prompt
 
 
+def test_what_changes___turn_comes_last_in_the_prompt() -> None:
+    """Le profil de l'apprenant doit etre en queue de prompt.
+
+    Ollama ne garde en cache que le plus long prefixe deja evalue : tout ce qui
+    suit le premier caractere qui change est recalcule. Le profil bouge a chaque
+    tour ; le contrat de sortie, jamais. Place avant, il faisait re-evaluer
+    plusieurs centaines de tokens a chaque phrase.
+    """
+    from app.ai.prompts import build_turn_prompt
+
+    prompt = build_turn_prompt(
+        TutorContext(weaknesses=[{"topic": "dative", "occurrences": 7}])
+    )
+
+    stable = prompt.index("## Output format")
+    volatile = prompt.index("## This learner, right now")
+    assert stable < volatile, "le contrat de sortie doit preceder le profil"
+
+    # Tout ce qui bouge d'un tour a l'autre est apres le point de bascule.
+    for section in ("Known weaknesses", "Recent mistakes", "Items due for review"):
+        assert prompt.index(section) > stable
+
+
 def test_system_prompt_handles_a_blank_profile() -> None:
     prompt = build_system_prompt(TutorContext())
     assert "no weakness identified yet" in prompt

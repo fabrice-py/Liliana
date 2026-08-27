@@ -15,8 +15,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.ai.llm import LLMProvider, get_llm_provider
-from app.ai.prompts import TutorContext, build_turn_prompt, get_mode
-from app.ai.structured import ResponseStreamParser, extract_json, normalise_turn
+from app.ai.prompts import (
+    TURN_RESPONSE_SCHEMA,
+    TutorContext,
+    build_turn_prompt,
+    get_mode,
+)
+from app.ai.structured import (
+    ResponseStreamParser,
+    extract_json,
+    is_meaningful_response,
+    normalise_turn,
+)
 from app.core.config import get_settings
 from app.core.exceptions import LLMError
 from app.core.logger import get_logger
@@ -129,12 +139,41 @@ class Tutor:
 
     # ------------------------------------------------------------ historique
     def _history(self, session_id: int) -> list[dict[str, str]]:
+        """Historique envoyé au modèle : uniquement des échanges complets.
+
+        La base conserve tout, y compris les tours ratés — c'est la trace de ce
+        qui s'est passé. Mais le modèle, lui, ne doit relire qu'une conversation
+        bien formée, question/réponse en alternance stricte. Deux écueils sinon :
+
+        * une réponse vide (« {} ») relue dans l'historique se fait imiter au
+          tour suivant, et la session ne produit plus que du vide ;
+        * une question restée sans réponse, quand le tour a échoué, laisse le
+          modèle face à plusieurs questions d'affilée — une forme qu'il n'a
+          jamais vue à l'entraînement, et à laquelle il répond mal.
+
+        Une session déjà abîmée se remet donc d'elle-même au tour suivant.
+        """
         limit = get_settings().llm_max_history_turns * 2
-        return [
-            {"role": message["role"], "content": message["content"]}
-            for message in message_repo.history(session_id, limit=limit)
-            if message["role"] in ("user", "assistant") and message["content"]
-        ]
+        turns: list[dict[str, str]] = []
+
+        for message in message_repo.history(session_id, limit=limit):
+            role, content = message["role"], message["content"]
+            if role not in ("user", "assistant") or not content:
+                continue
+
+            if role == "user":
+                if turns and turns[-1]["role"] == "user":
+                    turns.pop()  # la précédente est restée sans réponse
+                turns.append({"role": "user", "content": content})
+            elif turns and turns[-1]["role"] == "user":
+                if is_meaningful_response(content):
+                    turns.append({"role": "assistant", "content": content})
+                else:
+                    turns.pop()  # tour raté : on retire la question avec lui
+
+        if turns and turns[-1]["role"] == "user":
+            turns.pop()  # le tour en cours est ajouté séparément par _prepare
+        return turns
 
     # ----------------------------------------------------------------- tour
     def _prepare(
@@ -224,7 +263,12 @@ class Tutor:
             user_id=user_id, session_id=session_id, text=text, language=language,
             mode=mode, correction_mode=correction_mode, is_voice=is_voice,
         )
-        raw = self.llm.generate(conversation, json_mode=True)
+        raw = self.llm.generate(
+            conversation,
+            json_mode=True,
+            schema=TURN_RESPONSE_SCHEMA,
+            model=get_settings().llm_model_for(language),
+        )
         turn = normalise_turn(extract_json(raw), fallback_text=raw)
 
         return self._finalise(
@@ -267,7 +311,13 @@ class Tutor:
             for sentence in sentences.feed(delta):
                 yield TurnEvent(kind="sentence", text=sentence)
 
-        for chunk in self.llm.stream(conversation, json_mode=True):
+        chunks = self.llm.stream(
+            conversation,
+            json_mode=True,
+            schema=TURN_RESPONSE_SCHEMA,
+            model=get_settings().llm_model_for(language),
+        )
+        for chunk in chunks:
             yield from emit(parser.feed(chunk))
 
         yield from emit(parser.flush())

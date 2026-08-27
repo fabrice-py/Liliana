@@ -9,6 +9,7 @@ from app.core.exceptions import (
     AudioError,
     ConfigurationError,
     LilianaError,
+    TTSError,
     TTSUnavailableError,
 )
 from app.speech.audio import MAX_AUDIO_BYTES, maybe_save, validate_upload, wav_duration
@@ -162,6 +163,29 @@ def test_a_corrupt_voice_model_degrades_instead_of_crashing(isolated_settings) -
     assert provider.voice_path("english") is not None
     with pytest.raises(LilianaError):
         provider.synthesize("Hello", "english")
+
+
+@pytest.mark.parametrize("text", ["{}", "...", "???", "  {  }  ", "!!"])
+def test_text_without_a_single_sound_is_refused_cleanly(isolated_settings, text: str) -> None:
+    """Un modèle qui renvoie « {} » ne doit pas faire remonter une `wave.Error`.
+
+    Piper écrit alors un WAV sans en-tête et `wave` lève une erreur qui n'hérite
+    pas de LilianaError : elle traversait `_speak()` puis le flux SSE, coupant la
+    connexion sans le moindre message.
+    """
+    _install_fake_voice(isolated_settings, isolated_settings.tts_voice_english)
+
+    with pytest.raises(TTSError) as excinfo:
+        PiperTTS(isolated_settings).synthesize(text, "english")
+    assert isinstance(excinfo.value, LilianaError)
+
+
+def test_a_pronounceable_word_is_not_refused(isolated_settings) -> None:
+    """Le garde-fou ne doit pas rejeter du texte normal, accentué ou non latin."""
+    from app.speech.tts import _PRONOUNCEABLE_RE
+
+    for text in ("Hello.", "Où est la gare ?", "日本語", "42 !"):
+        assert _PRONOUNCEABLE_RE.search(text), text
 
 
 def test_null_tts_degrades_gracefully() -> None:

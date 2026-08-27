@@ -111,6 +111,72 @@ def test_empty_model_answer_raises_a_clear_error(user_id: int, session_id: int) 
     assert "could not produce an answer" in excinfo.value.user_message
 
 
+def test_an_empty_envelope_does_not_poison_the_session(user_id: int, session_id: int) -> None:
+    """Un « {} » du modèle ne doit jamais devenir un message de l'assistant.
+
+    Sinon il revient dans l'historique et le modèle l'imite à chaque tour
+    suivant : la conversation ne produit plus que des réponses vides.
+    """
+    with pytest.raises(LLMError):
+        Tutor(llm=FakeLLM(["{}"])).respond(
+            user_id=user_id, session_id=session_id, text="Hi", language="english",
+            mode="free_conversation",
+        )
+
+    stored = messages.history(session_id, limit=10)
+    assert [m["content"] for m in stored if m["role"] == "assistant"] == []
+
+    # Le tour suivant repart proprement.
+    result = Tutor(llm=FakeLLM([RICH_TURN])).respond(
+        user_id=user_id, session_id=session_id, text="Hi again", language="english",
+        mode="free_conversation",
+    )
+    assert result.response
+
+
+def test_an_already_poisoned_history_is_not_replayed(user_id: int, session_id: int) -> None:
+    """Une base déjà contaminée par une version antérieure doit se remettre seule."""
+    messages.add(session_id, "user", "Tell me about Berlin", "english")
+    messages.add(session_id, "assistant", "It is a lively city.", "english")
+    messages.add(session_id, "user", "Hello", "english")
+    messages.add(session_id, "assistant", "{}", "english")
+
+    history = Tutor(llm=FakeLLM())._history(session_id)
+
+    # Le tour raté disparaît entièrement, question comprise.
+    assert [m["content"] for m in history] == ["Tell me about Berlin", "It is a lively city."]
+
+
+def test_history_never_shows_two_questions_in_a_row(user_id: int, session_id: int) -> None:
+    """Des tours en échec laissent des questions sans réponse en base.
+
+    Les enchaîner donnerait au modèle une conversation qu'il n'a jamais vue —
+    plusieurs questions d'affilée — et sa réponse s'en ressent.
+    """
+    messages.add(session_id, "user", "First question", "english")
+    messages.add(session_id, "user", "Second question", "english")
+    messages.add(session_id, "user", "Third question", "english")
+    messages.add(session_id, "assistant", "An actual answer.", "english")
+
+    history = Tutor(llm=FakeLLM())._history(session_id)
+
+    roles = [m["role"] for m in history]
+    assert roles == ["user", "assistant"]
+    assert history[0]["content"] == "Third question"
+
+
+def test_a_complete_exchange_is_kept(user_id: int, session_id: int) -> None:
+    messages.add(session_id, "user", "How are you?", "english")
+    messages.add(session_id, "assistant", "Very well, thank you.", "english")
+
+    history = Tutor(llm=FakeLLM())._history(session_id)
+
+    assert history == [
+        {"role": "user", "content": "How are you?"},
+        {"role": "assistant", "content": "Very well, thank you."},
+    ]
+
+
 def test_empty_user_turn_is_rejected(user_id: int, session_id: int) -> None:
     with pytest.raises(LLMError):
         Tutor(llm=FakeLLM()).respond(
@@ -181,3 +247,63 @@ def test_text_turns_are_recorded_as_written(user_id: int, session_id: int) -> No
         language="english", mode="free_conversation", is_voice=False,
     )
     assert errors.count(user_id, "english", is_voice=False) == 1
+
+
+def test_the_turn_contract_is_sent_as_a_schema(user_id: int, session_id: int) -> None:
+    """Le contrat de sortie doit contraindre le decodage, pas seulement le prompt.
+
+    Sans cela le modele ecrit la correction dans `response` et laisse
+    `correction` et `errors` vides : la carte Correction, les statistiques et la
+    repetition espacee se retrouvent sans matiere.
+    """
+    from app.ai.prompts import TURN_RESPONSE_SCHEMA
+
+    llm = FakeLLM([RICH_TURN])
+    Tutor(llm=llm).respond(
+        user_id=user_id, session_id=session_id, text="Hi", language="english",
+        mode="free_conversation",
+    )
+    assert llm.schemas == [TURN_RESPONSE_SCHEMA]
+
+
+def test_the_streamed_turn_uses_the_same_contract(user_id: int, session_id: int) -> None:
+    from app.ai.prompts import TURN_RESPONSE_SCHEMA
+
+    llm = FakeLLM([RICH_TURN])
+    list(Tutor(llm=llm).respond_stream(
+        user_id=user_id, session_id=session_id, text="Hi", language="english",
+        mode="free_conversation",
+    ))
+    assert llm.schemas == [TURN_RESPONSE_SCHEMA]
+
+
+def test_response_comes_first_so_the_voice_can_start_early() -> None:
+    """L'ordre des champs du schema pilote l'ordre de generation.
+
+    `response` doit rester en tete, sinon la premiere phrase n'est prononcable
+    qu'apres la correction et tout le benefice du streaming disparait.
+    """
+    from app.ai.prompts import TURN_RESPONSE_SCHEMA
+
+    assert list(TURN_RESPONSE_SCHEMA["properties"])[0] == "response"
+    assert set(TURN_RESPONSE_SCHEMA["required"]) == set(TURN_RESPONSE_SCHEMA["properties"])
+
+
+def test_the_model_follows_the_language_being_practised(user_id: int, monkeypatch) -> None:
+    """Alterner anglais et allemand doit changer de modele, pas de qualite."""
+    monkeypatch.setenv("LLM_MODEL_ENGLISH", "small-fast-model")
+    monkeypatch.setenv("LLM_MODEL_GERMAN", "big-accurate-model")
+    from app.core.config import reload_settings
+
+    reload_settings()
+    llm = FakeLLM([RICH_TURN])
+    tutor = Tutor(llm=llm)
+
+    for language in ("english", "german"):
+        session = int(sessions.create(user_id, language, "free_conversation")["id"])
+        tutor.respond(
+            user_id=user_id, session_id=session, text="Hello", language=language,
+            mode="free_conversation",
+        )
+
+    assert llm.models == ["small-fast-model", "big-accurate-model"]

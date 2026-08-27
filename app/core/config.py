@@ -48,6 +48,19 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.7
     llm_timeout: float = 120.0
     llm_max_history_turns: int = 12
+    #: Durée pendant laquelle Ollama garde le modèle en mémoire entre deux tours.
+    #: Son défaut (5 min) fait payer un rechargement complet — plusieurs dizaines
+    #: de secondes sans GPU — dès qu'on réfléchit un peu trop longtemps avant de
+    #: répondre. `-1` = ne jamais décharger tant que Liliana tourne.
+    llm_keep_alive: str = "30m"
+    #: Modèle par langue. Le bon modèle dépend de la langue travaillée, pas de la
+    #: machine : sur ce contrat de sortie, un 1.5B corrige l'anglais aussi bien
+    #: qu'un 3B et près de trois fois plus vite, mais s'effondre sur les cas et
+    #: les genres allemands. Vide = on retombe sur `llm_model`, puis sur la
+    #: sélection automatique. Voir docs/llm.md.
+    llm_model_english: str = ""
+    llm_model_german: str = ""
+    llm_model_french: str = ""
 
     # ------------------------------------------------------------------ STT
     stt_provider: str = "faster-whisper"
@@ -106,6 +119,31 @@ class Settings(BaseSettings):
             "german": self.tts_voice_german,
             "french": self.tts_voice_french,
         }.get(language, self.tts_voice_english)
+
+    def llm_model_for(self, language: str) -> str:
+        """Modèle de langage à utiliser pour une langue donnée.
+
+        Retourne une chaîne vide si rien n'est imposé : à l'appelant de laisser
+        alors jouer ``LLM_MODEL`` puis la sélection automatique.
+        """
+        per_language = {
+            "english": self.llm_model_english,
+            "german": self.llm_model_german,
+            "french": self.llm_model_french,
+        }.get(language, "")
+        return (per_language or self.llm_model).strip()
+
+    def languages_with_their_own_model(self) -> dict[str, str]:
+        """Langues pour lesquelles un modèle spécifique est configuré."""
+        return {
+            language: model.strip()
+            for language, model in (
+                ("english", self.llm_model_english),
+                ("german", self.llm_model_german),
+                ("french", self.llm_model_french),
+            )
+            if model.strip()
+        }
 
     def ensure_directories(self) -> None:
         """Crée les répertoires nécessaires au démarrage."""

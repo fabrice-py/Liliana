@@ -6,8 +6,10 @@ Everything goes through one interface, in `app/ai/llm.py`:
 
 ```python
 class LLMProvider(ABC):
-    def generate(self, messages, *, temperature=None, json_mode=False) -> str: ...
-    def stream(self, messages, *, temperature=None) -> Iterator[str]: ...
+    def generate(self, messages, *, temperature=None, json_mode=False,
+                 schema=None) -> str: ...
+    def stream(self, messages, *, temperature=None, json_mode=False,
+               schema=None) -> Iterator[str]: ...
     def status(self) -> LLMStatus: ...
 ```
 
@@ -79,6 +81,24 @@ than a chatbot:
 **6. The error taxonomy for that language** — so a German turn can report
 `separable_verbs` or `gender_der_die_das`, which do not exist for English.
 
+### The order of these layers is a performance decision
+
+Ollama caches the longest prefix it has already evaluated; everything after the
+first character that differs must be computed again. On a CPU-only machine that
+costs real time — prompt evaluation runs at roughly 35-45 tokens per second,
+against 0.2 s for a prefix that is entirely cached.
+
+Layer 5 — what Liliana knows about you — changes on every single turn. Layers 1,
+3, 4, 6 and the output contract never change. So the volatile layer is emitted
+**last**, after the output contract, and only the tail is re-evaluated: about
+7 s per turn instead of the whole prompt.
+
+The conversation history follows it, which is why layer 5 is kept short: it sits
+in front of the history, and whatever precedes a change is all that stays cached.
+
+The order also happens to be sound pedagogy — what the model reads last is what
+it weighs most.
+
 ## Structured output
 
 Liliana asks for a single JSON object per turn:
@@ -101,8 +121,62 @@ Liliana asks for a single JSON object per turn:
 
 Only `response` is ever spoken. The rest feeds the memory.
 
-Ollama's `format: "json"` is requested, which constrains decoding — but small
-local models still get it wrong regularly, so the parser assumes nothing.
+### Why the contract is a schema, not a paragraph
+
+Describing the format in prose is not enough. Asked in prose, a 3B model
+understands the task, finds the right correction — and writes it into
+`response`, leaving `correction` and `errors` empty. The answer sounds fine and
+the learning engine gets nothing: no correction card, no error statistics,
+nothing to schedule for review. Measured on this machine, six sentences with an
+obvious mistake produced **zero** structured corrections.
+
+So `TURN_RESPONSE_SCHEMA` (`app/ai/prompts.py`) is passed to Ollama as `format`.
+It is the same contract, expressed as JSON Schema, and it constrains decoding
+itself: the fields can no longer be missing. The same six sentences then produced
+**six** structured corrections.
+
+Two properties of that schema are load-bearing:
+
+- **every field is required** — that is the whole point;
+- **`response` comes first** — fields are generated in schema order, so
+  `ResponseStreamParser` can start speaking before the correction is written.
+
+It costs almost nothing: 21.1 s with the schema against 19.9 s with plain
+`format: "json"` for the same turn. A server too old to accept an object
+`format` (Ollama < 0.5) is detected on the first refusal, logged once, and the
+provider falls back to `format: "json"` for the rest of its life.
+
+The parser still assumes nothing: a schema constrains shape, never sense.
+
+### One model per language
+
+Once the schema carries the structure, the model only has to be right about the
+language — and how much model that takes depends on which language. Measured on
+this contract, same prompt, same schema, mistakes repeated twice each:
+
+| | English | German | median per turn |
+|---|---|---|---|
+| `qwen2.5:1.5b-instruct` | 16/16 | ~50% | **7.5 s** |
+| `qwen2.5:3b-instruct` | 16/16 | ~70-75% | 21.5 s |
+
+In English the small model is the equal of the larger one and nearly three times
+faster. In German it collapses: it misses the `sein`/`haben` auxiliary entirely,
+and on `Ich mag der Kaffee nicht` it deletes the article instead of fixing the
+case — worse than silence for someone learning declensions. Cases and genders are
+the first thing a model loses as it shrinks.
+
+Hence `LLM_MODEL_ENGLISH` / `LLM_MODEL_GERMAN` / `LLM_MODEL_FRENCH`, resolved by
+`Settings.llm_model_for()` and passed per call — the same shape as the per-language
+Piper voices. Empty falls back to `LLM_MODEL`, then to auto-selection.
+
+Two things worth knowing:
+
+- **German accuracy varies between runs** (8, 9 and 11 out of 12 across three
+  identical series). Treat a single measurement as an estimate, not a verdict.
+- **Both models stay resident**, so alternating languages costs no reload —
+  provided Ollama is allowed to keep more than one model loaded, which is its
+  default. Inside the application, with history and a filled learner profile, an
+  English turn lands around 13 s rather than the 7.5 s of the isolated bench.
 
 ## Surviving bad JSON
 
@@ -118,6 +192,7 @@ local models still get it wrong regularly, so the parser assumes nothing.
 | Gets cut off mid-object | String and braces are closed, then parsed |
 | Returns `"errors": ["past_simple"]` | Strings are promoted to error objects |
 | Invents `"severity": "catastrophic"` | Falls back to `minor` |
+| Returns an empty envelope `{}` | Refused: it is not free text. Stored as the assistant's turn, it comes back in the next prompt and the model imitates it — the session then answers `{}` forever |
 | Ignores JSON entirely | **The raw text becomes the spoken answer** |
 
 That last row matters most: a model having a bad day costs you the correction

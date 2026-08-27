@@ -113,6 +113,24 @@ def _as_list_of_dicts(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+#: Enveloppe JSON vide : « {} », « [] », « null », ou de la ponctuation seule.
+_EMPTY_ENVELOPE_RE = re.compile(r"^(?:[\s{}\[\]\"',:;.]*|null|none|n/a)$", re.IGNORECASE)
+
+
+def is_meaningful_response(text: str) -> bool:
+    """Vrai si ``text`` porte quelque chose qu'on puisse réellement dire.
+
+    Un petit modèle renvoie parfois une enveloppe vide (« {} ») au lieu du tour
+    attendu. La traiter comme une réponse en texte libre a deux conséquences :
+    la synthèse vocale n'a aucun phonème à produire, et surtout « {} » est
+    enregistré comme message de l'assistant — au tour suivant le modèle relit sa
+    propre sortie vide dans l'historique et l'imite, indéfiniment. Mieux vaut
+    une erreur franche, que l'appelant sait présenter.
+    """
+    stripped = (text or "").strip()
+    return bool(stripped) and not _EMPTY_ENVELOPE_RE.match(stripped)
+
+
 def normalise_turn(parsed: dict[str, Any] | None, fallback_text: str) -> dict[str, Any]:
     """Normalise la réponse d'un tour de conversation.
 
@@ -125,7 +143,9 @@ def normalise_turn(parsed: dict[str, Any] | None, fallback_text: str) -> dict[st
     response = _as_str(parsed.get("response"))
     if not response:
         # Le modèle a répondu en texte libre : on parle ce texte, sans le JSON.
-        response = _as_str(fallback_text)
+        # Sauf s'il n'a rien produit d'exploitable : voir is_meaningful_response.
+        fallback = _as_str(fallback_text)
+        response = fallback if is_meaningful_response(fallback) else ""
 
     correction = parsed.get("correction")
     if isinstance(correction, dict):
