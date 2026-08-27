@@ -81,7 +81,6 @@ class ProgressTracker:
                 is_estimate=True,
             )
 
-        total_errors = error_repo.count(user_id, language)
         recent_errors = error_repo.recent(user_id, language, limit=200)
 
         by_kind: dict[str, int] = {}

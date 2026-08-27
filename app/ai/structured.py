@@ -257,3 +257,166 @@ def normalise_assessment(parsed: dict[str, Any] | None) -> dict[str, Any] | None
         else [],
         "summary": _as_str(parsed.get("summary")),
     }
+
+
+# ------------------------------------------------- lecture JSON incrémentale
+class ResponseStreamParser:
+    """Extrait le champ ``response`` d'un JSON **pendant** sa réception.
+
+    Le contrat de sortie (cf. ``RESPONSE_SCHEMA_PROMPT``) place ``response`` en
+    premier : on peut donc commencer à parler la réponse alors que la correction
+    et les erreurs sont encore en train d'arriver. C'est tout l'intérêt du
+    streaming — sans cela il faudrait attendre le JSON complet.
+
+    Deux modes, choisis automatiquement :
+
+    * **JSON** — le flux commence par ``{`` : on cherche la clé ``response`` et
+      on décode sa valeur au fur et à mesure.
+    * **texte brut** — le modèle a ignoré la consigne : tout ce qui arrive est
+      considéré comme la réponse parlée (même repli que ``normalise_turn``).
+
+    Utilisation ::
+
+        parser = ResponseStreamParser()
+        for chunk in llm.stream(messages):
+            if delta := parser.feed(chunk):
+                ...  # texte nouvellement disponible
+        raw = parser.raw
+    """
+
+    _KEY_RE = re.compile(r'"response"\s*:\s*"')
+    #: Nombre de caractères reçus sans voir la clé ``response`` au-delà duquel on
+    #: abandonne l'hypothèse JSON. Assez large pour laisser passer un préambule
+    #: bavard ("Sure! Here you go: {…"), assez court pour que le repli en texte
+    #: brut reste fluide.
+    _PLAIN_TEXT_AFTER = 80
+
+    def __init__(self) -> None:
+        self.raw = ""            # tout ce qui a été reçu, pour le parsing final
+        self._emitted = ""       # texte déjà rendu à l'appelant
+        self._value_start = -1   # index, dans self.raw, du 1er caractère de la valeur
+        self._plain = False      # mode texte brut
+        self._closed = False     # guillemet fermant rencontré
+
+    # ------------------------------------------------------------- interne
+    @staticmethod
+    def _safe_prefix(raw_value: str) -> str:
+        """Plus long préfixe ne se terminant pas au milieu d'une séquence d'échappement.
+
+        Un fragment réseau peut couper ``\\n`` en deux, ou ``\\u00e9`` n'importe où :
+        décoder un tel préfixe échouerait.
+        """
+        # Antislashs finaux en nombre impair : le dernier ouvre un échappement.
+        trailing = len(raw_value) - len(raw_value.rstrip("\\"))
+        if trailing % 2:
+            raw_value = raw_value[:-1]
+
+        # Séquence \uXXXX incomplète en fin de tampon.
+        marker = raw_value.rfind("\\u")
+        if marker != -1 and len(raw_value) - marker < 6:
+            # Vérifie que cet antislash est bien un échappement, pas un `\\` littéral.
+            preceding = len(raw_value[:marker]) - len(raw_value[:marker].rstrip("\\"))
+            if preceding % 2 == 0:
+                raw_value = raw_value[:marker]
+        return raw_value
+
+    def _decode(self, raw_value: str) -> str:
+        try:
+            return json.loads(f'"{self._safe_prefix(raw_value)}"')
+        except (json.JSONDecodeError, ValueError):
+            return ""
+
+    def _detect_mode(self) -> None:
+        """Décide entre JSON et texte brut dès qu'il y a de quoi trancher."""
+        if self._plain or self._value_start != -1:
+            return
+
+        stripped = self.raw.lstrip()
+        if not stripped:
+            return
+
+        # La clé peut arriver après du bavardage ("Sure! Here you go: {…").
+        match = self._KEY_RE.search(self.raw)
+        if match:
+            self._value_start = match.end()
+            return
+
+        # Toujours pas de clé après un volume significatif : le modèle a répondu
+        # en texte libre. Une règle unique, car juger trop tôt sur l'absence
+        # d'accolade ferait basculer à tort un préambule comme "Sure!\n".
+        if len(stripped) >= self._PLAIN_TEXT_AFTER:
+            self._plain = True
+
+    # -------------------------------------------------------------- public
+    def feed(self, chunk: str) -> str:
+        """Ajoute un fragment. Retourne le texte **nouvellement** disponible."""
+        if not chunk:
+            return ""
+        self.raw += chunk
+        self._detect_mode()
+
+        if self._plain:
+            delta = self.raw[len(self._emitted):]
+            self._emitted = self.raw
+            return delta
+
+        if self._value_start == -1 or self._closed:
+            return ""
+
+        # Cherche le guillemet fermant non échappé de la valeur.
+        raw_value = self.raw[self._value_start:]
+        end = self._find_closing_quote(raw_value)
+        if end != -1:
+            raw_value = raw_value[:end]
+            self._closed = True
+
+        decoded = self._decode(raw_value)
+        if not decoded.startswith(self._emitted):
+            # Le décodage d'un préfixe plus long peut réviser un caractère
+            # partiellement décodé : on repart proprement de la version longue.
+            self._emitted = decoded
+            return decoded
+
+        delta = decoded[len(self._emitted):]
+        self._emitted = decoded
+        return delta
+
+    @staticmethod
+    def _find_closing_quote(raw_value: str) -> int:
+        escaped = False
+        for index, char in enumerate(raw_value):
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                return index
+        return -1
+
+    def flush(self) -> str:
+        """À appeler en fin de flux. Retourne ce qui restait à émettre.
+
+        Indispensable pour une réponse en texte libre plus courte que
+        ``_PLAIN_TEXT_AFTER`` : le seuil n'a jamais été atteint, donc ``feed``
+        n'a rien émis.
+        """
+        if self._plain or self._value_start != -1:
+            return ""
+        self._plain = True
+        delta = self.raw[len(self._emitted):]
+        self._emitted = self.raw
+        return delta
+
+    @property
+    def text(self) -> str:
+        """Réponse parlée telle que reconstituée jusqu'ici."""
+        return self._emitted
+
+    @property
+    def is_plain_text(self) -> bool:
+        """Le modèle a-t-il ignoré le format JSON demandé ?"""
+        return self._plain
+
+    def finish(self) -> dict[str, Any]:
+        """Parse le flux complet et retourne un tour normalisé."""
+        return normalise_turn(extract_json(self.raw), fallback_text=self.raw)

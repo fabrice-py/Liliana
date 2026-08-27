@@ -10,12 +10,13 @@ tour de parole.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.ai.llm import LLMProvider, get_llm_provider
 from app.ai.prompts import TutorContext, build_turn_prompt, get_mode
-from app.ai.structured import extract_json, normalise_turn
+from app.ai.structured import ResponseStreamParser, extract_json, normalise_turn
 from app.core.config import get_settings
 from app.core.exceptions import LLMError
 from app.core.logger import get_logger
@@ -30,6 +31,7 @@ from app.database.repositories import (
 from app.language.languages import get_language, is_supported
 from app.learning.progress import progress_tracker
 from app.learning.spaced_repetition import spaced_repetition
+from app.speech.tts import SentenceBuffer
 
 logger = get_logger(__name__)
 
@@ -60,6 +62,22 @@ class TurnResult:
             "structured": self.structured,
             "level": self.level,
         }
+
+
+@dataclass(slots=True)
+class TurnEvent:
+    """Étape d'un tour de conversation diffusé en continu.
+
+    ``kind`` vaut :
+
+    * ``delta``    — un fragment de texte à afficher immédiatement ;
+    * ``sentence`` — une phrase complète, prête à être synthétisée ;
+    * ``done``     — le tour est terminé, ``result`` porte le tour complet.
+    """
+
+    kind: str
+    text: str = ""
+    result: "TurnResult | None" = None
 
 
 class Tutor:
@@ -119,7 +137,7 @@ class Tutor:
         ]
 
     # ----------------------------------------------------------------- tour
-    def respond(
+    def _prepare(
         self,
         *,
         user_id: int,
@@ -127,11 +145,13 @@ class Tutor:
         text: str,
         language: str,
         mode: str,
-        correction_mode: str | None = None,
-        is_voice: bool = False,
-        duration_seconds: int = 0,
-    ) -> TurnResult:
-        """Traite un tour de parole et met à jour la mémoire de Liliana."""
+        correction_mode: str | None,
+        is_voice: bool,
+    ) -> tuple[str, list[dict[str, str]]]:
+        """Valide l'entrée, enregistre le tour utilisateur, assemble le prompt.
+
+        Retourne (langue effective, conversation prête pour le modèle).
+        """
         text = (text or "").strip()
         if not text:
             raise LLMError(
@@ -148,15 +168,23 @@ class Tutor:
         # échoue, ce que l'utilisateur a dit n'est pas perdu.
         message_repo.add(session_id, "user", text, language, is_voice)
 
-        conversation = [
+        return language, [
             {"role": "system", "content": build_turn_prompt(context)},
             *history,
             {"role": "user", "content": text},
         ]
 
-        raw = self.llm.generate(conversation, json_mode=True)
-        turn = normalise_turn(extract_json(raw), fallback_text=raw)
-
+    def _finalise(
+        self,
+        *,
+        user_id: int,
+        session_id: int,
+        language: str,
+        turn: dict[str, Any],
+        duration_seconds: int,
+        is_voice: bool,
+    ) -> TurnResult:
+        """Contrôle la réponse, l'enregistre et met à jour la mémoire."""
         if not turn["response"]:
             raise LLMError(
                 "model returned nothing usable",
@@ -177,6 +205,82 @@ class Tutor:
             session_id=session_id,
             structured=turn["structured"],
             level=str(profile.get("level") or "A1"),
+        )
+
+    def respond(
+        self,
+        *,
+        user_id: int,
+        session_id: int,
+        text: str,
+        language: str,
+        mode: str,
+        correction_mode: str | None = None,
+        is_voice: bool = False,
+        duration_seconds: int = 0,
+    ) -> TurnResult:
+        """Traite un tour de parole et met à jour la mémoire de Liliana."""
+        language, conversation = self._prepare(
+            user_id=user_id, session_id=session_id, text=text, language=language,
+            mode=mode, correction_mode=correction_mode, is_voice=is_voice,
+        )
+        raw = self.llm.generate(conversation, json_mode=True)
+        turn = normalise_turn(extract_json(raw), fallback_text=raw)
+
+        return self._finalise(
+            user_id=user_id, session_id=session_id, language=language, turn=turn,
+            duration_seconds=duration_seconds, is_voice=is_voice,
+        )
+
+    def respond_stream(
+        self,
+        *,
+        user_id: int,
+        session_id: int,
+        text: str,
+        language: str,
+        mode: str,
+        correction_mode: str | None = None,
+        is_voice: bool = False,
+        duration_seconds: int = 0,
+    ) -> Iterator[TurnEvent]:
+        """Même tour, diffusé au fil de la génération.
+
+        Émet le texte dès qu'il arrive puis, phrase par phrase, de quoi
+        synthétiser la voix sans attendre la fin de la réponse. Le JSON complet
+        (correction, erreurs, vocabulaire) n'est exploité qu'à la fin, mais la
+        clé ``response`` vient en tête du contrat de sortie : elle est donc
+        disponible bien avant.
+        """
+        language, conversation = self._prepare(
+            user_id=user_id, session_id=session_id, text=text, language=language,
+            mode=mode, correction_mode=correction_mode, is_voice=is_voice,
+        )
+
+        parser = ResponseStreamParser()
+        sentences = SentenceBuffer()
+
+        def emit(delta: str) -> Iterator[TurnEvent]:
+            if not delta:
+                return
+            yield TurnEvent(kind="delta", text=delta)
+            for sentence in sentences.feed(delta):
+                yield TurnEvent(kind="sentence", text=sentence)
+
+        for chunk in self.llm.stream(conversation, json_mode=True):
+            yield from emit(parser.feed(chunk))
+
+        yield from emit(parser.flush())
+        if remainder := sentences.flush():
+            yield TurnEvent(kind="sentence", text=remainder)
+
+        turn = parser.finish()
+        yield TurnEvent(
+            kind="done",
+            result=self._finalise(
+                user_id=user_id, session_id=session_id, language=language, turn=turn,
+                duration_seconds=duration_seconds, is_voice=is_voice,
+            ),
         )
 
     # ----------------------------------------------------------- mémoire

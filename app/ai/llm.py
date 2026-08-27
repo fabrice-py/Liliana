@@ -55,7 +55,11 @@ class LLMProvider(ABC):
 
     @abstractmethod
     def stream(
-        self, messages: list[dict[str, str]], *, temperature: float | None = None
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None = None,
+        json_mode: bool = False,
     ) -> Iterator[str]:
         """Génère la réponse par fragments (pour réduire la latence perçue)."""
 
@@ -139,9 +143,13 @@ class OllamaProvider(LLMProvider):
         return content
 
     def stream(
-        self, messages: list[dict[str, str]], *, temperature: float | None = None
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None = None,
+        json_mode: bool = False,
     ) -> Iterator[str]:
-        payload = self._payload(messages, temperature, json_mode=False)
+        payload = self._payload(messages, temperature, json_mode)
         payload["stream"] = True
         try:
             with httpx.Client(timeout=self.timeout) as client:

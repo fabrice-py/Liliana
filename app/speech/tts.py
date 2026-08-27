@@ -12,6 +12,7 @@ Voir ``scripts/download_voices.py`` pour les télécharger.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
@@ -28,6 +29,58 @@ from app.core.exceptions import ConfigurationError, TTSError, TTSUnavailableErro
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+#: Ponctuation qui termine une phrase, suivie d'une espace ou de la fin du texte.
+_SENTENCE_END_RE = re.compile(r"[.!?…]+[\"')\]]*(?=\s|$)|[\n\r]+")
+
+#: En deçà, on ne coupe pas : « Mr. », « 3.5 » ou « etc. » ne sont pas des phrases.
+_MIN_SENTENCE_CHARS = 15
+
+
+class SentenceBuffer:
+    """Découpe un texte qui arrive par fragments en phrases prononçables.
+
+    Permet de synthétiser la première phrase pendant que le modèle écrit encore
+    la suite : c'est ce qui fait tomber la latence perçue (cf. §30).
+    """
+
+    def __init__(self, min_chars: int = _MIN_SENTENCE_CHARS) -> None:
+        self.min_chars = min_chars
+        self._pending = ""
+
+    def feed(self, chunk: str) -> list[str]:
+        """Ajoute un fragment. Retourne les phrases devenues complètes."""
+        if not chunk:
+            return []
+        self._pending += chunk
+
+        sentences: list[str] = []
+        while True:
+            match = self._next_boundary()
+            if match is None:
+                break
+            sentence = self._pending[: match.end()].strip()
+            self._pending = self._pending[match.end():].lstrip()
+            if sentence:
+                sentences.append(sentence)
+        return sentences
+
+    def _next_boundary(self) -> re.Match[str] | None:
+        """Première coupure acceptable dans le tampon courant."""
+        for match in _SENTENCE_END_RE.finditer(self._pending):
+            if match.end() >= self.min_chars:
+                return match
+        return None
+
+    def flush(self) -> str:
+        """Retourne le reste, même s'il ne se termine pas par une ponctuation."""
+        remainder, self._pending = self._pending.strip(), ""
+        return remainder
+
+    @property
+    def pending(self) -> str:
+        return self._pending
 
 
 @dataclass(slots=True)

@@ -11,6 +11,7 @@ import io
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -52,6 +53,15 @@ class Transcription:
         }
 
 
+@dataclass(slots=True)
+class TranscriptionEvent:
+    """Étape d'une transcription en cours."""
+
+    text: str                              # texte cumulé jusqu'ici
+    is_final: bool = False
+    transcription: Transcription | None = None  # rempli uniquement sur l'évènement final
+
+
 class STTProvider(ABC):
     """Interface de reconnaissance vocale."""
 
@@ -67,6 +77,19 @@ class STTProvider(ABC):
     @abstractmethod
     def is_available(self) -> tuple[bool, str]:
         """(disponible, détail) — sans charger le modèle."""
+
+    def transcribe_stream(
+        self, audio: bytes, language: str | None = None
+    ) -> Iterator[TranscriptionEvent]:
+        """Transcrit en émettant les segments au fur et à mesure.
+
+        Implémentation par défaut : un seul évènement, final. Les backends
+        capables de décoder par segments surchargent cette méthode.
+        """
+        transcription = self.transcribe(audio, language)
+        yield TranscriptionEvent(
+            text=transcription.text, is_final=True, transcription=transcription
+        )
 
     def warmup(self) -> None:  # pragma: no cover - dépend du modèle installé
         """Précharge le modèle pour éviter la latence du premier tour."""
@@ -125,7 +148,8 @@ class FasterWhisperSTT(STTProvider):
             return self._model
 
     # -------------------------------------------------------------- public
-    def transcribe(self, audio: bytes, language: str | None = None) -> Transcription:
+    def _decode(self, audio: bytes, language: str | None) -> tuple[Any, Any]:
+        """Lance le décodage. Retourne (générateur de segments, informations)."""
         if not audio:
             raise EmptyTranscriptionError("empty audio payload")
 
@@ -133,10 +157,8 @@ class FasterWhisperSTT(STTProvider):
         # En mode apprentissage, on privilégie la langue cible (cf. §5) ; sinon
         # Whisper détecte lui-même parmi les langues supportées.
         forced_code = whisper_code(language) if language else None
-
-        started = time.perf_counter()
         try:
-            segments, info = model.transcribe(
+            return model.transcribe(
                 io.BytesIO(audio),
                 language=forced_code,
                 beam_size=self.settings.stt_beam_size,
@@ -144,12 +166,6 @@ class FasterWhisperSTT(STTProvider):
                 vad_parameters={"min_silence_duration_ms": 300},
                 condition_on_previous_text=False,
             )
-            collected = [
-                {"start": segment.start, "end": segment.end, "text": segment.text}
-                for segment in segments
-            ]
-        except EmptyTranscriptionError:
-            raise
         except Exception as exc:  # noqa: BLE001 - PyAV/CTranslate2 lèvent large
             raise STTError(
                 f"transcription failed: {exc}",
@@ -159,18 +175,63 @@ class FasterWhisperSTT(STTProvider):
                 ),
             ) from exc
 
-        text = " ".join(segment["text"].strip() for segment in collected).strip()
+    def transcribe_stream(
+        self, audio: bytes, language: str | None = None
+    ) -> Iterator[TranscriptionEvent]:
+        """Émet le texte au fil du décodage, puis la transcription complète.
+
+        Le générateur de segments de faster-whisper est paresseux : consommer
+        segment par segment permet d'afficher les premiers mots pendant que la
+        fin de la phrase est encore en cours de décodage.
+        """
+        started = time.perf_counter()
+        forced_code = whisper_code(language) if language else None
+        segments, info = self._decode(audio, language)
+
+        collected: list[dict[str, Any]] = []
+        try:
+            for segment in segments:
+                collected.append(
+                    {"start": segment.start, "end": segment.end, "text": segment.text}
+                )
+                partial = " ".join(item["text"].strip() for item in collected).strip()
+                if partial:
+                    yield TranscriptionEvent(text=partial)
+        except Exception as exc:  # noqa: BLE001 - le décodage est paresseux : il peut échouer ici
+            raise STTError(
+                f"transcription failed while decoding: {exc}",
+                user_message=(
+                    "Liliana could not decode your recording. Try again, and "
+                    "check that your microphone is working."
+                ),
+            ) from exc
+
+        text = " ".join(item["text"].strip() for item in collected).strip()
         if not text:
             raise EmptyTranscriptionError("no speech detected in audio")
 
-        return Transcription(
+        yield TranscriptionEvent(
             text=text,
-            language=getattr(info, "language", forced_code or "") or "",
-            language_probability=float(getattr(info, "language_probability", 0.0) or 0.0),
-            duration=float(getattr(info, "duration", 0.0) or 0.0),
-            elapsed=time.perf_counter() - started,
-            segments=collected,
+            is_final=True,
+            transcription=Transcription(
+                text=text,
+                language=getattr(info, "language", forced_code or "") or "",
+                language_probability=float(getattr(info, "language_probability", 0.0) or 0.0),
+                duration=float(getattr(info, "duration", 0.0) or 0.0),
+                elapsed=time.perf_counter() - started,
+                segments=collected,
+            ),
         )
+
+    def transcribe(self, audio: bytes, language: str | None = None) -> Transcription:
+        """Transcription complète, en consommant le flux jusqu'au bout."""
+        final: Transcription | None = None
+        for event in self.transcribe_stream(audio, language):
+            if event.is_final:
+                final = event.transcription
+        if final is None:  # pragma: no cover - transcribe_stream lève avant
+            raise EmptyTranscriptionError("no speech detected in audio")
+        return final
 
     def is_available(self) -> tuple[bool, str]:
         try:

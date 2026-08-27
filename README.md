@@ -40,6 +40,9 @@ your microphone → silence detection → speech-to-text → linguistic analysis
       → local LLM → answer → pedagogical correction → speech synthesis → speaker
 ```
 
+Each stage hands its output to the next as it is produced, so you hear the
+first sentence while the rest is still being written.
+
 She keeps a separate CEFR level (A1–C2) for each language, tracks six skills,
 records every mistake by type, schedules what you got wrong for spaced
 repetition, and adapts the difficulty as you improve.
@@ -66,6 +69,10 @@ The conversation stays a conversation. The correction is recorded either way.
 - Local speech-to-text with faster-whisper; the target language is preferred
   while you are practising it.
 - Local speech synthesis with Piper, a different voice per language.
+- **Streamed end to end**: your transcription appears as it decodes, Liliana's
+  answer writes itself on screen, and she starts speaking after the first
+  sentence instead of waiting for the whole turn. On a CPU-only laptop that
+  takes time-to-first-word from ~2.9 s down to ~0.4 s.
 - Adjustable speaking rate ("Liliana, speak more slowly").
 
 **Teaching**
@@ -378,8 +385,15 @@ The suite runs against a temporary SQLite database and simulated engines, so
 it needs neither Ollama, nor a Whisper model, nor a Piper voice. It covers the
 database and repositories, malformed-JSON recovery, the correction pipeline,
 progress computation, spaced repetition, voice commands, pronunciation scoring,
-the placement test, session handling, exercises, and the failure paths (LLM
-down, TTS missing, silent recording, empty upload).
+the placement test, session handling, exercises, the streaming pipeline, and the
+failure paths (LLM down, TTS missing, silent recording, empty upload, a stream
+cut off mid-answer).
+
+Two of them are worth knowing about: one asserts that the first sentence is
+ready for the synthesiser **before half the model output has arrived** — the
+property the whole streaming design exists for — and another asserts that the
+streamed and non-streamed paths produce an identical turn, so they cannot
+silently drift apart.
 
 ---
 
@@ -392,7 +406,6 @@ current version:
   `app/language/languages.py` and a voice;
 - forced phonetic alignment for real pronunciation scoring;
 - a wake word, so you do not need the button at all;
-- streaming speech-to-text and synthesis, to cut perceived latency further;
 - importing your own documents and books as learning material;
 - job-interview practice, exam preparation, professional and travel modes.
 

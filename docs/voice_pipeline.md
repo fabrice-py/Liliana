@@ -114,7 +114,67 @@ Speaking rate maps to Piper's `length_scale` inverted, so that `speed=0.8` means
 `null` and the interface shows the text. Losing the voice must never lose the
 lesson.
 
-## 6. Latency
+## 6. Streaming
+
+Nothing above waits for the step after it to be *finished*. The whole turn is
+delivered as Server-Sent Events on `/api/voice/turn/stream` and
+`/api/chat/turn/stream`:
+
+| Event | Carries | When |
+|---|---|---|
+| `transcription` | partial then final text | as Whisper decodes each segment |
+| `command` | a recognised voice command | before generation starts |
+| `delta` | a fragment of the spoken answer | as the model writes |
+| `audio` | one WAV per sentence | as each sentence completes |
+| `done` | the full turn: correction, errors, vocabulary, level | at the end |
+| `error` | a message written for a human | on any failure, mid-stream included |
+
+### How the answer can be spoken before the JSON exists
+
+The model is asked for a single JSON object, which normally means waiting for
+the closing brace before anything can be read. Two things avoid that:
+
+1. **`response` comes first in the output contract.** By the time the model
+   starts writing `"correction"`, the sentence to speak is already complete.
+2. **`ResponseStreamParser` decodes that field incrementally**
+   (`app/ai/structured.py`). It tracks the JSON string state — escapes, `\uXXXX`
+   sequences split across two network chunks, braces inside string values — and
+   emits only the newly available text. If the model ignores JSON entirely it
+   flips to plain-text mode and streams everything, the same fallback the
+   non-streaming path uses.
+
+`SentenceBuffer` (`app/speech/tts.py`) then cuts that text into speakable
+sentences, skipping false boundaries like `Mr.` or `3.5` by requiring a minimum
+length. Each finished sentence is synthesised and sent immediately.
+
+### Measured
+
+On a synthetic model emitting a fragment every 40 ms — roughly a 3B model on a
+CPU — for a three-sentence answer:
+
+```
+   280 ms  first text on screen
+   443 ms  first audio playing        <- the user hears Liliana here
+   583 ms  second sentence
+   787 ms  third sentence
+  2859 ms  turn complete (correction, errors, level)
+```
+
+Without streaming, nothing reaches the user before 2859 ms. **Time to first
+word spoken drops from 2.9 s to 0.4 s** — and the analysis finishes quietly
+while the answer is already being heard.
+
+The browser queues the WAVs and plays them back to back (`audioQueue` in
+`frontend/app.js`), so a sentence arriving late never interrupts one already
+playing.
+
+### If the stream breaks
+
+The interface falls back to the non-streaming endpoints automatically. A late
+answer beats no answer, and both paths are covered by tests that assert they
+produce the identical turn.
+
+## 7. Latency budget
 
 Where the time goes on a CPU-only laptop, for a five-second sentence:
 
@@ -122,14 +182,10 @@ Where the time goes on a CPU-only laptop, for a five-second sentence:
 |---|---|---|
 | VAD | 0 | Runs during your speech |
 | Upload | < 50 ms | Loopback, Opus-compressed |
-| Whisper (`base`, int8) | 0.5–1.5 s | Model kept warm, greedy decoding |
-| LLM (3B, CPU) | 1–4 s | Bounded history, short answers requested |
-| Piper | 0.2–0.6 s | Voice kept loaded |
+| Whisper (`base`, int8) | 0.5–1.5 s | Model kept warm, greedy decoding, segments streamed |
+| LLM (3B, CPU) | 1–4 s | Bounded history, short answers, **streamed** |
+| Piper | 0.2–0.6 s | Voice kept loaded, **one call per sentence** |
 
 The interface says which phase it is in — *Listening… / Transcribing… /
-Thinking…* — and reports the real timings after each turn, so slowness is
-attributable rather than mysterious.
-
-Streaming (partial transcription, token-by-token generation, sentence-by-
-sentence synthesis) is the next lever; `LLMProvider.stream()` already exists for
-it.
+Thinking… / Speaking…* — and reports the real timings after each turn, so
+slowness is attributable rather than mysterious.

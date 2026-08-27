@@ -83,21 +83,30 @@ function addBubble(who, text, { replayable = false } = {}) {
   bubble.appendChild(label);
 
   const body = document.createElement('div');
+  body.className = 'body';
   body.textContent = text;
   bubble.appendChild(body);
 
-  if (replayable) {
-    const replay = document.createElement('button');
-    replay.className = 'replay';
-    replay.type = 'button';
-    replay.textContent = '↻ Play again';
-    replay.addEventListener('click', () => speakText(text));
-    bubble.appendChild(replay);
-  }
+  if (replayable) addReplayButton(bubble, text);
 
   $('conversation').appendChild(bubble);
   scrollDown();
   return bubble;
+}
+
+function bubbleBody(bubble) {
+  return bubble.querySelector('.body');
+}
+
+/** Ajoute (une seule fois) le bouton de réécoute sous une bulle de Liliana. */
+function addReplayButton(bubble, text) {
+  if (!text || bubble.querySelector('.replay')) return;
+  const replay = document.createElement('button');
+  replay.className = 'replay';
+  replay.type = 'button';
+  replay.textContent = '↻ Play again';
+  replay.addEventListener('click', () => speakText(text));
+  bubble.appendChild(replay);
 }
 
 /** Diff mot à mot (plus longue sous-séquence commune) pour surligner la correction. */
@@ -180,22 +189,98 @@ function addCorrection(correction, errors) {
 
 /* ------------------------------------------------------------------ audio */
 
-function playBase64(audioBase64, mimeType) {
+function base64ToBlobUrl(audioBase64, mimeType) {
   const binary = atob(audioBase64);
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-  const url = URL.createObjectURL(new Blob([bytes], { type: mimeType || 'audio/wav' }));
-  const player = $('player');
-  player.src = url;
-  player.onended = () => URL.revokeObjectURL(url);
-  player.play().catch(() => { /* lecture bloquée tant que l'utilisateur n'a pas interagi */ });
+  return URL.createObjectURL(new Blob([bytes], { type: mimeType || 'audio/wav' }));
+}
+
+/* File d'attente audio.
+ *
+ * En streaming, Liliana renvoie une piste par phrase : la première arrive
+ * pendant que le modèle écrit encore la suite. On les enchaîne ici pour que
+ * l'utilisateur entende une réponse continue.
+ */
+const audioQueue = {
+  urls: [],
+  playing: false,
+
+  push(audioBase64, mimeType) {
+    this.urls.push(base64ToBlobUrl(audioBase64, mimeType));
+    if (!this.playing) this.playNext();
+  },
+
+  playNext() {
+    const url = this.urls.shift();
+    if (!url) { this.playing = false; return; }
+    this.playing = true;
+    const player = $('player');
+    player.src = url;
+    player.onended = () => { URL.revokeObjectURL(url); this.playNext(); };
+    player.onerror = () => { URL.revokeObjectURL(url); this.playNext(); };
+    player.play().catch(() => {
+      // Lecture refusée tant que l'utilisateur n'a pas interagi avec la page.
+      URL.revokeObjectURL(url);
+      this.playNext();
+    });
+  },
+
+  reset() {
+    this.urls.forEach(URL.revokeObjectURL);
+    this.urls = [];
+    this.playing = false;
+    const player = $('player');
+    player.pause();
+    player.removeAttribute('src');
+  },
+};
+
+function playBase64(audioBase64, mimeType) {
+  audioQueue.push(audioBase64, mimeType);
+}
+
+/* Lecture d'un flux Server-Sent Events reçu en réponse à un POST.
+ * `EventSource` ne sait faire que du GET : on parse le flux à la main.
+ */
+async function* readServerSentEvents(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf('\n\n');
+    while (boundary !== -1) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      let name = '';
+      let data = '';
+      for (const line of block.split('\n')) {
+        if (line.startsWith('event: ')) name = line.slice(7);
+        else if (line.startsWith('data: ')) data = line.slice(6);
+      }
+      if (name && data) {
+        try {
+          yield { name, data: JSON.parse(data) };
+        } catch {
+          // Bloc tronqué : on l'ignore plutôt que d'interrompre le flux.
+        }
+      }
+      boundary = buffer.indexOf('\n\n');
+    }
+  }
 }
 
 async function speakText(text) {
   if (!$('voice-output').checked) return;
   try {
     const speech = await postJSON('/speak', { text, language: state.language, speed: state.speed });
-    playBase64(speech.audio_base64, speech.mime_type);
+    audioQueue.reset();
+    audioQueue.push(speech.audio_base64, speech.mime_type);
   } catch (error) {
     toast(error.message);
   }
@@ -390,8 +475,88 @@ function applyCommandFeedback(command) {
   if (command.speed) state.speed = command.speed;
 }
 
+/* Tour de conversation diffusé.
+ *
+ * Le texte s'écrit au fur et à mesure et la voix démarre dès la première
+ * phrase, sans attendre la fin de la génération. En cas de problème sur le
+ * flux, on retombe sur l'endpoint classique : mieux vaut une réponse tardive
+ * que pas de réponse.
+ */
+async function runStreamingTurn({ path, body, headers, userBubble }) {
+  audioQueue.reset();
+
+  let answerBubble = null;
+  let streamedText = '';
+  let sawAnything = false;
+
+  const response = await fetch(api(path), { method: 'POST', body, headers });
+  if (!response.ok) throw new Error(await readError(response));
+  if (!response.body) throw new Error('This browser cannot read streaming responses.');
+
+  for await (const { name, data } of readServerSentEvents(response)) {
+    sawAnything = true;
+    switch (name) {
+      case 'transcription':
+        if (userBubble) bubbleBody(userBubble).textContent = data.text;
+        if (!data.partial) setStatus('Thinking…');
+        break;
+
+      case 'command':
+        applyCommandFeedback(data);
+        break;
+
+      case 'delta':
+        if (!answerBubble) {
+          answerBubble = addBubble('Liliana', '');
+          setStatus('Speaking…');
+        }
+        streamedText += data.text;
+        bubbleBody(answerBubble).textContent = streamedText;
+        scrollDown();
+        break;
+
+      case 'audio':
+        audioQueue.push(data.audio_base64, data.mime_type);
+        break;
+
+      case 'done':
+        finishStreamedTurn(answerBubble, streamedText, data);
+        return data;
+
+      case 'error':
+        if (answerBubble && !streamedText) answerBubble.remove();
+        throw new Error(data.message);
+
+      default:
+        break;
+    }
+  }
+
+  if (!sawAnything) throw new Error('Liliana closed the connection without answering.');
+  throw new Error('The answer was cut off. Please try again.');
+}
+
+/** Réconcilie la bulle diffusée avec le tour complet reçu à la fin. */
+function finishStreamedTurn(answerBubble, streamedText, payload) {
+  const bubble = answerBubble || addBubble('Liliana', payload.response);
+  // Le JSON final fait autorité : il peut différer légèrement du flux brut.
+  if (payload.response && payload.response !== streamedText) {
+    bubbleBody(bubble).textContent = payload.response;
+  }
+  addReplayButton(bubble, payload.response);
+  state.lastResponse = payload.response;
+
+  addCorrection(payload.correction, payload.errors);
+  if (payload.vocabulary && payload.vocabulary.length) {
+    toast(`New vocabulary saved: ${payload.vocabulary.map((e) => e.word).join(', ')}`, false);
+  }
+  scrollDown();
+}
+
 async function sendVoiceTurn(blob) {
+  if (state.busy) return;
   setBusy(true, 'Transcribing…');
+
   const form = new FormData();
   form.append('audio', blob, 'turn.webm');
   form.append('language', state.language);
@@ -402,18 +567,22 @@ async function sendVoiceTurn(blob) {
 
   const placeholder = addBubble('You', '…');
   try {
-    const response = await fetch(api('/voice/turn'), { method: 'POST', body: form });
-    if (!response.ok) throw new Error(await readError(response));
-    const payload = await response.json();
-
-    placeholder.lastElementChild.textContent = payload.transcription.text;
-    setStatus('Thinking…');
-    renderTurn(payload);
-    setStatus(`Ready — ${payload.transcription.elapsed}s transcribe, ${payload.llm_elapsed}s think`);
+    const payload = await runStreamingTurn({
+      path: '/voice/turn/stream', body: form, userBubble: placeholder,
+    });
+    setStatus(`Ready — ${payload.llm_elapsed}s`);
   } catch (error) {
-    placeholder.remove();
-    toast(error.message);
-    setStatus('Ready');
+    // Repli sur le chemin non diffusé : plus lent, mais il fonctionne.
+    try {
+      const payload = await postForm('/voice/turn', form);
+      bubbleBody(placeholder).textContent = payload.transcription.text;
+      renderTurn(payload);
+      setStatus(`Ready — ${payload.llm_elapsed}s (no streaming)`);
+    } catch (fallbackError) {
+      placeholder.remove();
+      toast(fallbackError.message || error.message);
+      setStatus('Ready');
+    }
   } finally {
     setBusy(false);
   }
@@ -423,23 +592,41 @@ async function sendTextTurn(text) {
   if (!text.trim() || state.busy) return;
   addBubble('You', text);
   setBusy(true, 'Thinking…');
+
+  const request = {
+    text,
+    language: state.language,
+    mode: state.mode,
+    correction_mode: state.correctionMode,
+    speak: $('voice-output').checked,
+    speed: state.speed,
+  };
+
   try {
-    const payload = await postJSON('/chat/turn', {
-      text,
-      language: state.language,
-      mode: state.mode,
-      correction_mode: state.correctionMode,
-      speak: $('voice-output').checked,
-      speed: state.speed,
+    const payload = await runStreamingTurn({
+      path: '/chat/turn/stream',
+      body: JSON.stringify(request),
+      headers: { 'Content-Type': 'application/json' },
     });
-    renderTurn(payload);
     setStatus(`Ready — ${payload.llm_elapsed}s`);
   } catch (error) {
-    toast(error.message);
-    setStatus('Ready');
+    try {
+      const payload = await postJSON('/chat/turn', request);
+      renderTurn(payload);
+      setStatus(`Ready — ${payload.llm_elapsed}s (no streaming)`);
+    } catch (fallbackError) {
+      toast(fallbackError.message || error.message);
+      setStatus('Ready');
+    }
   } finally {
     setBusy(false);
   }
+}
+
+async function postForm(path, form) {
+  const response = await fetch(api(path), { method: 'POST', body: form });
+  if (!response.ok) throw new Error(await readError(response));
+  return response.json();
 }
 
 /* ------------------------------------------------------------- exercices */

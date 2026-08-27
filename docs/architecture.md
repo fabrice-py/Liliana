@@ -95,6 +95,7 @@ has a defined behaviour:
 | Whisper model missing | Explains it downloads once, suggests a smaller size |
 | Piper or voice missing | Answer is returned as **text**; the conversation continues |
 | Model returns broken JSON | Raw text is used as the spoken answer, no correction |
+| Stream breaks mid-answer | An `error` event closes it; the browser retries without streaming |
 | Silent recording | HTTP 422, "Liliana did not hear anything" |
 | Microphone denied | Explains browser *and* OS permissions |
 | Empty or oversized upload | HTTP 400 before any model is loaded |

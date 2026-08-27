@@ -7,10 +7,13 @@ exposée sur le réseau. Aucune requête SQL ici — tout passe par les dépôts
 from __future__ import annotations
 
 import base64
+import json
 import time
+from collections.abc import Iterator
 from typing import Any, Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.ai.tutor import tutor
@@ -88,6 +91,101 @@ def _speak(text: str, language: str, speed: float | None = None) -> dict[str, An
         "voice": speech.voice,
         "elapsed": round(speech.elapsed, 2),
     }
+
+
+# -------------------------------------------------------------------- SSE
+#: En-têtes qui empêchent tout intermédiaire de tamponner le flux : sans eux,
+#: le streaming n'apporte rien (l'utilisateur reçoit tout d'un bloc à la fin).
+SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    """Formate un évènement Server-Sent Events."""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _sse_error(exc: LilianaError) -> str:
+    logger.warning("Flux interrompu — %s: %s", type(exc).__name__, exc)
+    return _sse("error", {"error": type(exc).__name__, "message": exc.user_message})
+
+
+def _stream_turn(
+    *,
+    user_id: int,
+    text: str,
+    language: str,
+    mode: str,
+    correction_mode: str | None,
+    is_voice: bool,
+    speak: bool,
+    speed: float,
+    duration_seconds: int = 0,
+) -> Iterator[str]:
+    """Diffuse un tour de conversation : texte au fil de l'eau, voix par phrase.
+
+    C'est ici que se joue la latence perçue : la première phrase est synthétisée
+    et envoyée pendant que le modèle écrit encore la suite (cf. §30).
+    """
+    command = detect_command(text)
+    applied_command: dict[str, Any] | None = None
+    if command:
+        applied_command = {"action": command.action, **command.payload}
+        language, mode, correction_mode, speed = _apply_command(
+            command, language, mode, correction_mode, speed
+        )
+        yield _sse("command", applied_command)
+
+    session = session_repo.get_or_create_open(user_id, language, mode)
+    started = time.perf_counter()
+    spoken_chunks = 0
+
+    for event in tutor.respond_stream(
+        user_id=user_id,
+        session_id=int(session["id"]),
+        text=text,
+        language=language,
+        mode=mode,
+        correction_mode=correction_mode,
+        is_voice=is_voice,
+        duration_seconds=duration_seconds,
+    ):
+        if event.kind == "delta":
+            yield _sse("delta", {"text": event.text})
+        elif event.kind == "sentence" and speak:
+            speech = _speak(event.text, language, speed)
+            if speech is not None:
+                yield _sse("audio", {**speech, "index": spoken_chunks, "text": event.text})
+                spoken_chunks += 1
+        elif event.kind == "done" and event.result is not None:
+            payload = event.result.as_dict()
+            payload["command"] = applied_command
+            payload["language"] = language
+            payload["mode"] = mode
+            payload["llm_elapsed"] = round(time.perf_counter() - started, 2)
+            payload["spoken_chunks"] = spoken_chunks
+            yield _sse("done", payload)
+
+
+def _apply_command(
+    command: Any, language: str, mode: str, correction_mode: str | None, speed: float
+) -> tuple[str, str, str | None, float]:
+    """Applique une commande vocale et retourne l'état mis à jour."""
+    if command.action == "switch_language":
+        language = _resolve_language(command.payload["language"])
+        app_settings.set("language", language)
+    elif command.action == "set_mode":
+        mode = _resolve_mode(command.payload["mode"])
+        app_settings.set("mode", mode)
+    elif command.action == "set_correction_mode":
+        correction_mode = command.payload["correction_mode"]
+        app_settings.set("correction_mode", correction_mode)
+    elif command.action in ("speak_slower", "speak_faster"):
+        speed = float(command.payload["speed"])
+    return language, mode, correction_mode, speed
 
 
 # ---------------------------------------------------------------- schémas
@@ -294,20 +392,11 @@ def _handle_turn(
     """Chemin commun aux tours vocaux et écrits."""
     command = detect_command(text)
     applied_command: dict[str, Any] | None = None
-
     if command:
         applied_command = {"action": command.action, **command.payload}
-        if command.action == "switch_language":
-            language = _resolve_language(command.payload["language"])
-            app_settings.set("language", language)
-        elif command.action == "set_mode":
-            mode = _resolve_mode(command.payload["mode"])
-            app_settings.set("mode", mode)
-        elif command.action == "set_correction_mode":
-            correction_mode = command.payload["correction_mode"]
-            app_settings.set("correction_mode", correction_mode)
-        elif command.action in ("speak_slower", "speak_faster"):
-            speed = float(command.payload["speed"])
+        language, mode, correction_mode, speed = _apply_command(
+            command, language, mode, correction_mode, speed
+        )
 
     session = session_repo.get_or_create_open(user_id, language, mode)
     session_id = int(session["id"])
@@ -390,6 +479,88 @@ async def voice_turn(
     )
     payload["transcription"] = transcription.as_dict()
     return payload
+
+
+@router.post("/chat/turn/stream")
+def chat_turn_stream(payload: TurnRequest) -> StreamingResponse:
+    """Tour écrit, diffusé en Server-Sent Events."""
+    user_id = _current_user_id()
+    language = _resolve_language(payload.language)
+    mode = _resolve_mode(payload.mode)
+
+    def events() -> Iterator[str]:
+        try:
+            yield from _stream_turn(
+                user_id=user_id,
+                text=payload.text,
+                language=language,
+                mode=mode,
+                correction_mode=payload.correction_mode,
+                is_voice=False,
+                speak=payload.speak,
+                speed=payload.speed,
+            )
+        except LilianaError as exc:
+            yield _sse_error(exc)
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+@router.post("/voice/turn/stream")
+async def voice_turn_stream(
+    audio: UploadFile = File(...),
+    language: str | None = Form(default=None),
+    mode: str | None = Form(default=None),
+    correction_mode: str | None = Form(default=None),
+    speak: bool = Form(default=True),
+    speed: float = Form(default=1.0),
+) -> StreamingResponse:
+    """Tour vocal diffusé de bout en bout.
+
+    L'utilisateur voit sa transcription se former, puis la réponse s'écrire, et
+    entend la première phrase pendant que la suite est encore en génération.
+    """
+    data = await audio.read()
+    try:
+        validate_upload(data, audio.content_type)
+    except LilianaError as exc:
+        raise _fail(exc, status=400) from exc
+
+    maybe_save(data)  # no-op tant que SAVE_AUDIO=false
+
+    user_id = _current_user_id()
+    resolved_language = _resolve_language(language)
+    resolved_mode = _resolve_mode(mode)
+    resolved_speed = max(0.3, min(speed, 2.0))
+
+    def events() -> Iterator[str]:
+        try:
+            transcription = None
+            for step in get_stt_provider().transcribe_stream(data, language=resolved_language):
+                if step.is_final:
+                    transcription = step.transcription
+                else:
+                    yield _sse("transcription", {"text": step.text, "partial": True})
+
+            if transcription is None:  # pragma: no cover - le flux lève avant
+                raise EmptyTranscriptionError("no speech detected")
+            yield _sse("transcription", {**transcription.as_dict(), "partial": False})
+
+            yield from _stream_turn(
+                user_id=user_id,
+                text=transcription.text,
+                language=resolved_language,
+                mode=resolved_mode,
+                correction_mode=correction_mode,
+                is_voice=True,
+                speak=speak,
+                speed=resolved_speed,
+                duration_seconds=int(transcription.duration),
+            )
+        except LilianaError as exc:
+            yield _sse_error(exc)
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @router.post("/speak")

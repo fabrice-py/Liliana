@@ -146,6 +146,15 @@ grading — each with its own schema prompt and a temperature suited to the task
 
 ## Streaming
 
-`LLMProvider.stream()` is implemented for Ollama but not yet wired into the
-interface. It is the main remaining lever on perceived latency: start speaking
-the first sentence while the rest is still being generated.
+`LLMProvider.stream(messages, json_mode=True)` drives the streamed turn. The
+output contract deliberately puts `response` first, so `ResponseStreamParser`
+can hand that field to the speech synthesiser while the model is still writing
+the correction and the error list.
+
+`Tutor.respond_stream()` yields three kinds of event — `delta` (text to show),
+`sentence` (text to speak), `done` (the complete, persisted turn) — and shares
+`_prepare()` and `_finalise()` with the non-streaming `respond()`, so the two
+paths cannot drift apart. A test asserts they produce the identical turn.
+
+Details and measurements: [`voice_pipeline.md`](voice_pipeline.md), section
+*Streaming*.

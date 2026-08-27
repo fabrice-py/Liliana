@@ -15,6 +15,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.ai.llm import LLMProvider  # noqa: E402
+from app.speech.stt import STTProvider  # noqa: E402
+from app.speech.tts import TTSProvider  # noqa: E402
+
 
 @pytest.fixture(autouse=True)
 def isolated_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
@@ -53,7 +57,7 @@ def isolated_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterat
     reload_settings()
 
 
-class FakeLLM:
+class FakeLLM(LLMProvider):
     """Provider LLM déterministe.
 
     ``responses`` est une file de chaînes brutes renvoyées dans l'ordre ; la
@@ -62,8 +66,9 @@ class FakeLLM:
 
     name = "fake"
 
-    def __init__(self, responses: list[str] | None = None) -> None:
+    def __init__(self, responses: list[str] | None = None, chunk_size: int = 7) -> None:
         self.responses = responses or ['{"response": "Hello!", "errors": []}']
+        self.chunk_size = chunk_size
         self.calls: list[list[dict[str, str]]] = []
 
     def generate(self, messages, *, temperature=None, json_mode=False):  # noqa: ANN001
@@ -72,8 +77,12 @@ class FakeLLM:
             return self.responses.pop(0)
         return self.responses[0]
 
-    def stream(self, messages, *, temperature=None):  # noqa: ANN001
-        yield self.generate(messages, temperature=temperature)
+    def stream(self, messages, *, temperature=None, json_mode=False):  # noqa: ANN001
+        """Découpe la réponse en petits fragments, comme le ferait un vrai modèle."""
+        text = self.generate(messages, temperature=temperature, json_mode=json_mode)
+        size = max(1, self.chunk_size)
+        for start in range(0, len(text), size):
+            yield text[start : start + size]
 
     def status(self):
         from app.ai.llm import LLMStatus
@@ -81,12 +90,17 @@ class FakeLLM:
         return LLMStatus(available=True, provider="fake", model="fake-model", detail="ready")
 
 
-class FakeSTT:
-    """Provider STT déterministe."""
+class FakeSTT(STTProvider):
+    """Provider STT déterministe.
+
+    Hérite de STTProvider afin d'exercer le vrai contrat — y compris le repli
+    ``transcribe_stream`` fourni par la classe de base.
+    """
 
     name = "fake"
 
     def __init__(self, text: str = "Yesterday I go to the cinema.") -> None:
+        super().__init__()
         self.text = text
         self.calls = 0
 
@@ -112,7 +126,7 @@ class FakeSTT:
         return None
 
 
-class FakeTTS:
+class FakeTTS(TTSProvider):
     """Provider TTS déterministe (renvoie un petit WAV valide)."""
 
     name = "fake"
