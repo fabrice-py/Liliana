@@ -22,6 +22,9 @@ DEFAULT_EASE = 2.5
 #: Après un échec, on revoit l'élément très vite.
 FAILURE_INTERVAL_DAYS = 10 / (60 * 24)  # 10 minutes
 
+#: Format des horodatages stockés, identique à celui des dépôts.
+TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 
 @dataclass(slots=True)
 class ReviewOutcome:
@@ -122,6 +125,9 @@ class SpacedRepetition:
         success = int(current.get("success_count", 0))
         failure = int(current.get("failure_count", 0))
 
+        # Un seul instant de référence pour les deux horodatages : la révision a
+        # lieu maintenant, la prochaine est calculée à partir de ce même instant.
+        reviewed_at = _now()
         outcome = compute_next_review(
             quality=quality,
             repetitions=int(current.get("repetitions", 0)),
@@ -129,6 +135,7 @@ class SpacedRepetition:
             ease=float(current.get("difficulty", DEFAULT_EASE)),
             success_count=success,
             failure_count=failure,
+            now=reviewed_at,
         )
         if quality < 3:
             failure += 1
@@ -146,8 +153,8 @@ class SpacedRepetition:
             success_count=success,
             failure_count=failure,
             confidence=outcome.confidence,
-            last_review=outcome.next_review.strftime("%Y-%m-%d %H:%M:%S"),
-            next_review=outcome.next_review.strftime("%Y-%m-%d %H:%M:%S"),
+            last_review=reviewed_at.strftime(TIMESTAMP_FORMAT),
+            next_review=outcome.next_review.strftime(TIMESTAMP_FORMAT),
         )
 
     def due(self, user_id: int, language: str, limit: int = 20, item_type: str | None = None):

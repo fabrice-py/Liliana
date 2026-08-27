@@ -84,6 +84,16 @@ def test_review_persists_and_reschedules(user_id: int) -> None:
     assert item["repetitions"] == 1
 
 
+def test_review_records_when_it_happened_not_when_it_is_due(user_id: int) -> None:
+    """``last_review`` est la date de la révision, jamais celle de la suivante."""
+    spaced_repetition.register(user_id, "english", "vocabulary", "sleeve")
+    spaced_repetition.review(user_id, "english", "vocabulary", "sleeve", quality=5)
+
+    item = reviews.get(user_id, "english", "vocabulary", "sleeve")
+    assert item["last_review"] < item["next_review"]
+    assert item["last_review"] <= datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def test_due_items_are_returned_when_the_date_has_passed(user_id: int) -> None:
     past = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
     reviews.upsert(user_id, "german", "grammar", "dative", next_review=past)
