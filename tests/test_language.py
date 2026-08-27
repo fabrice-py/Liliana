@@ -101,13 +101,13 @@ def test_perfect_reading_scores_full_marks() -> None:
 
 def test_th_substitution_is_detected() -> None:
     result = analyse("I think this thing", "I sink dis sing", "english")
-    assert result.score < 70
-    assert "the English TH sound" in result.problem_sounds
+    assert result.score < 75
+    assert any("TH" in sound for sound in result.problem_sounds)
 
 
 def test_missing_umlaut_is_detected() -> None:
     result = analyse("Ich möchte ein Brötchen", "Ich mochte ein Brotchen", "german")
-    assert "the German Umlaut Ö" in result.problem_sounds
+    assert any("Ö" in sound for sound in result.problem_sounds)
 
 
 def test_empty_transcription_is_handled() -> None:
@@ -218,3 +218,74 @@ def test_placement_answers_are_case_insensitive() -> None:
     items = get_items("english")
     answers = {item.id: item.answer.upper() for item in items if item.level == "A1"}
     assert score_objective("english", answers).correct == 2
+
+
+# ------------------------------------------------- analyse phonétique (§7)
+def test_punctuation_is_not_a_phoneme() -> None:
+    """Un point final ne doit pas compter comme un son manqué."""
+    from app.language import phonemes
+
+    if not phonemes.is_available():
+        pytest.skip("phonémisation indisponible sur cette installation")
+    comparison = phonemes.compare("I think this is fine.", "I think this is fine", "english")
+    assert comparison.accuracy == 1.0
+    assert comparison.diffs == []
+
+
+def test_phoneme_comparison_sees_what_spelling_cannot() -> None:
+    """« möchte » entendu « mochte » : deux vrais sons manqués, pas un accent."""
+    from app.language import phonemes
+
+    if not phonemes.is_available():
+        pytest.skip("phonémisation indisponible sur cette installation")
+    comparison = phonemes.compare("Ich möchte", "Ich mochte", "german")
+    assert comparison.accuracy < 1.0
+    assert any("Ö" in label for label in comparison.labels)
+
+
+def test_phoneme_labels_map_to_real_drill_categories() -> None:
+    """Chaque son signalé doit renvoyer vers une catégorie qui existe vraiment."""
+    from app.language.phonemes import _FAMILIES, _PHONEME_LABELS
+    from app.language.pronunciation import categories_for, category_for_sound
+
+    known = set(categories_for("english")) | set(categories_for("german"))
+    for label in list(_PHONEME_LABELS.values()) + [name for _, name in _FAMILIES]:
+        category = category_for_sound(label)
+        assert category is None or category in known, f"{label!r} -> {category!r}"
+
+
+def test_analysis_degrades_without_the_phonemizer(monkeypatch) -> None:
+    """Sans piper-tts, l'analyse doit rester utilisable, pas planter."""
+    from app.language import phonemes
+    from app.language.pronunciation import analyse
+
+    monkeypatch.setattr(phonemes, "compare", lambda *args, **kwargs: None)
+    result = analyse("I think this thing", "I sink dis sing", "english")
+    assert result.method == "spelling"
+    assert result.phoneme_accuracy is None
+    assert result.score < 100
+    assert result.problem_sounds
+
+
+@pytest.mark.parametrize("language", ["english", "german"])
+def test_practice_sentences_exist_for_every_category(language: str) -> None:
+    from app.language.pronunciation import categories_for, practice_sentences
+
+    for category in categories_for(language):
+        assert practice_sentences(language, category), category
+
+
+def test_practice_sentence_targets_a_recorded_weakness() -> None:
+    from app.language.pronunciation import pick_sentence
+
+    category, sentence = pick_sentence("german", weak_sounds=["the German Ö versus O"])
+    assert category == "Ö"
+    assert "ö" in sentence.lower()
+
+
+def test_practice_sentence_rotates() -> None:
+    from app.language.pronunciation import pick_sentence
+
+    first = pick_sentence("english", category="TH", rotation=0)[1]
+    second = pick_sentence("english", category="TH", rotation=1)[1]
+    assert first != second

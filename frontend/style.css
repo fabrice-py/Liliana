@@ -321,3 +321,40 @@ button:disabled { opacity: .55; cursor: not-allowed; }
   .topbar-controls { width: 100%; }
   .field { flex: 1; }
 }
+
+/* --------------------------------------------------- prononciation (§7) */
+.score-ring {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin-bottom: 14px;
+}
+.score-ring .big {
+  font-size: 40px; font-weight: 700; line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.score-ring .breakdown { display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
+.score-ring .breakdown span { color: var(--text-dim); }
+.score-ring .breakdown b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+.score-good { color: var(--ok); }
+.score-mid  { color: var(--warn); }
+.score-poor { color: var(--err); }
+
+/* Chaque mot lu, coloré selon ce que la reconnaissance a réellement entendu. */
+.word-map { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; font-size: 17px; }
+.word-map .w { padding: 2px 7px; border-radius: 7px; border-bottom: 2px solid transparent; }
+.word-map .w.ok      { border-bottom-color: var(--ok); }
+.word-map .w.shaky   { border-bottom-color: var(--warn); background: rgba(240, 180, 92, .10); }
+.word-map .w.wrong   { border-bottom-color: var(--err); background: rgba(240, 100, 92, .12); }
+.word-map .w.missing { border-bottom-color: var(--err); opacity: .5; text-decoration: line-through; }
+.word-map .w .heard  { display: block; font-size: 11px; color: var(--err); }
+
+.phoneme-diffs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.phoneme-diffs .pd {
+  font-size: 12.5px; padding: 3px 9px; border-radius: 999px;
+  background: var(--bg-soft); border: 1px solid var(--border);
+}
+.phoneme-diffs .pd code { color: var(--err); font-size: 13px; }
+.phoneme-diffs .pd code + code { color: var(--ok); }
+
+.method-note { font-size: 12px; color: var(--text-dim); margin-top: 12px; }
+
+#record-pronunciation.recording { background: var(--err); animation: pulse 1.4s infinite; }

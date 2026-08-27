@@ -126,21 +126,40 @@ class PiperTTS(TTSProvider):
         self._lock = threading.Lock()
 
     # ---------------------------------------------------------- résolution
+    @staticmethod
+    def _is_complete(path: Path) -> bool:
+        """Une voix Piper, c'est le modèle **et** sa configuration.
+
+        Un téléchargement interrompu laisse le ``.onnx`` sans son ``.onnx.json`` :
+        sans cette vérification, Piper échoue plus loin avec une erreur illisible.
+        """
+        return path.is_file() and path.with_suffix(".onnx.json").is_file()
+
     def voice_path(self, language: str) -> Path | None:
-        """Chemin du fichier ``.onnx`` de la voix configurée, s'il existe."""
+        """Chemin du fichier ``.onnx`` de la voix configurée, si elle est complète."""
         voice = self.settings.tts_voice_for(language)
         if not voice:
             return None
         candidate = Path(voice)
-        if candidate.suffix == ".onnx" and candidate.is_file():
+        if candidate.suffix == ".onnx" and self._is_complete(candidate):
             return candidate  # chemin absolu fourni dans la configuration
         for path in (
             self.voices_dir / f"{voice}.onnx",
             self.voices_dir / voice / f"{voice}.onnx",
         ):
-            if path.is_file():
+            if self._is_complete(path):
                 return path
         return None
+
+    def incomplete_voices(self) -> list[str]:
+        """Voix dont le modèle est présent mais la configuration manquante."""
+        if not self.voices_dir.is_dir():
+            return []
+        return sorted(
+            path.stem
+            for path in self.voices_dir.rglob("*.onnx")
+            if not path.with_suffix(".onnx.json").is_file()
+        )
 
     def _binary(self) -> str | None:
         binary = self.settings.tts_binary
@@ -158,8 +177,14 @@ class PiperTTS(TTSProvider):
         with self._lock:
             if key not in self._loaded:
                 logger.info("Chargement de la voix Piper %s", path.name)
-                self._loaded[key] = PiperVoice.load(str(path))
-        return self._loaded[key]
+                try:
+                    self._loaded[key] = PiperVoice.load(str(path))
+                except Exception as exc:  # noqa: BLE001 - fichier corrompu, ONNX illisible…
+                    # On ne laisse jamais remonter une erreur brute : l'appelant
+                    # bascule sur le binaire, puis sur un message compréhensible.
+                    logger.warning("Voix Piper %s inutilisable : %s", path.name, exc)
+                    return None
+        return self._loaded.get(key)
 
     # ------------------------------------------------------------ synthèse
     def _synthesize_python(self, voice: Any, text: str, length_scale: float) -> bytes | None:
@@ -273,14 +298,25 @@ class PiperTTS(TTSProvider):
         voices = self.available_voices()
         missing = [name for name, present in voices.items() if not present]
         engine = "python module" if has_python else "binary"
+        incomplete = self.incomplete_voices()
+
         if not any(voices.values()):
-            return False, (
-                f"Piper ({engine}) is installed but no voice was found in "
-                f"{self.voices_dir}. Run `python scripts/download_voices.py`."
+            hint = (
+                f"These voices are incomplete (the .onnx.json config is missing): "
+                f"{', '.join(incomplete)}. "
+                if incomplete
+                else ""
             )
+            return False, (
+                f"Piper ({engine}) is installed but no usable voice was found in "
+                f"{self.voices_dir}. {hint}Run `python scripts/download_voices.py`."
+            )
+
         detail = f"piper ({engine})"
         if missing:
             detail += f"; missing voices: {', '.join(missing)}"
+        if incomplete:
+            detail += f"; incomplete: {', '.join(incomplete)}"
         return True, detail
 
     def available_voices(self) -> dict[str, bool]:

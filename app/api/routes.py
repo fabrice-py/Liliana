@@ -30,7 +30,7 @@ from app.database.repositories import (
     users as user_repo,
     vocabulary as vocabulary_repo,
 )
-from app.language import pronunciation as pronunciation_module
+from app.language import phonemes, pronunciation as pronunciation_module
 from app.language.assessment import assessment_service, build_test
 from app.language.commands import detect_command
 from app.language.correction import correction_service
@@ -674,6 +674,38 @@ def teach_vocabulary(payload: VocabularyTeach) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------ prononciation
+@router.get("/pronunciation/sentence")
+def pronunciation_sentence(
+    language: str | None = None,
+    category: str | None = None,
+    exclude: str | None = None,
+) -> dict[str, Any]:
+    """Propose une phrase à lire, ciblée sur les sons réellement ratés.
+
+    Fonctionne sans modèle de langage : la banque est locale et instantanée.
+    """
+    user_id = _current_user_id()
+    resolved = _resolve_language(language)
+
+    attempts = pronunciation_repo.recent(user_id, resolved, limit=10)
+    weak_sounds = [sound for attempt in attempts for sound in attempt["phoneme_tags"]]
+    category_name, sentence = pronunciation_module.pick_sentence(
+        resolved,
+        category=category,
+        weak_sounds=weak_sounds,
+        exclude=exclude,
+        rotation=len(attempts),
+    )
+    return {
+        "language": resolved,
+        "category": category_name,
+        "sentence": sentence,
+        "categories": pronunciation_module.categories_for(resolved),
+        "targeted": bool(weak_sounds and not category),
+        "phonetic_analysis": phonemes.is_available(),
+    }
+
+
 @router.post("/pronunciation/check")
 async def check_pronunciation(
     audio: UploadFile = File(...),
@@ -689,13 +721,19 @@ async def check_pronunciation(
 
     resolved = _resolve_language(language)
     try:
-        transcription = get_stt_provider().transcribe(data, language=resolved)
+        # Les horodatages par mot apportent la confiance acoustique : plus coûteux,
+        # donc demandés ici seulement, pas à chaque tour de conversation.
+        transcription = get_stt_provider().transcribe(
+            data, language=resolved, word_timestamps=True
+        )
     except EmptyTranscriptionError as exc:
         raise _fail(exc, status=422) from exc
     except LilianaError as exc:
         raise _fail(exc) from exc
 
-    result = pronunciation_module.analyse(expected, transcription.text, resolved)
+    result = pronunciation_module.analyse(
+        expected, transcription.text, resolved, words=transcription.words
+    )
     pronunciation_repo.add(
         _current_user_id(),
         resolved,

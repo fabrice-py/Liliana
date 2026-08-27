@@ -94,6 +94,8 @@ has a defined behaviour:
 | Model not pulled | HTTP 503 naming the `ollama pull` command |
 | Whisper model missing | Explains it downloads once, suggests a smaller size |
 | Piper or voice missing | Answer is returned as **text**; the conversation continues |
+| espeak-ng missing | Pronunciation scored on spelling instead of sounds, and says so |
+| `LLM_MODEL` not set | The best installed Ollama model is chosen and reported |
 | Model returns broken JSON | Raw text is used as the spoken answer, no correction |
 | Stream breaks mid-answer | An `error` event closes it; the browser retries without streaming |
 | Silent recording | HTTP 422, "Liliana did not hear anything" |
@@ -116,7 +118,7 @@ Each one earns its place:
 | `pydantic-settings` | Typed `.env` loading | Yes, at the cost of hand-written parsing |
 | `httpx` | HTTP client for Ollama, with streaming | `urllib` could do it, without streaming |
 | `faster-whisper` | Local speech-to-text; bundles PyAV, so **no system ffmpeg** | It *is* the feature |
-| `piper-tts` | Optional. The `piper` binary works too | Yes — Liliana degrades to text |
+| `piper-tts` | Liliana's voice **and** the espeak-ng phonemizer behind the pronunciation analysis | Yes — voice off, pronunciation falls back to comparing words |
 | `pytest` | Test suite | Development only |
 
 The database uses the standard library's `sqlite3` rather than an ORM: the
@@ -125,8 +127,9 @@ schema is small, the queries are simple, and it removes a large dependency.
 ## Extending
 
 - **A new language** — add a `Language` entry in `app/language/languages.py`
-  (name, Whisper code, error taxonomy, sounds to watch), a voice in `.env`, and
-  optionally a placement bank in `app/language/assessment.py`.
+  (name, Whisper code, espeak voice, error taxonomy, sounds to watch), a voice
+  in `.env`, and optionally a placement bank in `app/language/assessment.py`
+  plus practice sentences in `app/language/pronunciation.py`.
 - **A new conversation mode** — add a `ConversationMode` to
   `CONVERSATION_MODES` in `app/ai/prompts.py`. The UI picks it up from
   `/api/config` automatically.

@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 from app.core.config import reload_settings
-from app.core.exceptions import AudioError, ConfigurationError, TTSUnavailableError
+from app.core.exceptions import (
+    AudioError,
+    ConfigurationError,
+    LilianaError,
+    TTSUnavailableError,
+)
 from app.speech.audio import MAX_AUDIO_BYTES, maybe_save, validate_upload, wav_duration
 from app.speech.stt import FasterWhisperSTT, get_stt_provider, reset_stt_provider
 from app.speech.tts import NullTTS, PiperTTS, get_tts_provider, reset_tts_provider
@@ -111,15 +116,52 @@ def test_piper_reports_missing_voices(isolated_settings) -> None:
     assert detail
 
 
-def test_piper_finds_an_installed_voice(isolated_settings) -> None:
-    voices_dir = isolated_settings.models_dir / "piper"
+def _install_fake_voice(settings, name: str, with_config: bool = True) -> None:
+    voices_dir = settings.models_dir / "piper"
     voices_dir.mkdir(parents=True, exist_ok=True)
-    (voices_dir / f"{isolated_settings.tts_voice_english}.onnx").write_bytes(b"fake-model")
+    (voices_dir / f"{name}.onnx").write_bytes(b"fake-model")
+    if with_config:
+        (voices_dir / f"{name}.onnx.json").write_text('{"audio": {"sample_rate": 22050}}')
+
+
+def test_piper_finds_an_installed_voice(isolated_settings) -> None:
+    _install_fake_voice(isolated_settings, isolated_settings.tts_voice_english)
 
     provider = PiperTTS(isolated_settings)
     assert provider.voice_path("english") is not None
     assert provider.available_voices()["english"] is True
     assert provider.available_voices()["german"] is False
+
+
+def test_a_half_downloaded_voice_is_not_considered_installed(isolated_settings) -> None:
+    """Un .onnx sans son .onnx.json = téléchargement interrompu, pas une voix."""
+    _install_fake_voice(isolated_settings, isolated_settings.tts_voice_english, with_config=False)
+
+    provider = PiperTTS(isolated_settings)
+    assert provider.voice_path("english") is None
+    assert provider.incomplete_voices() == [isolated_settings.tts_voice_english]
+
+    available, detail = provider.is_available()
+    assert available is False
+    assert "incomplete" in detail.lower()
+
+
+def test_a_half_downloaded_voice_gives_an_actionable_error(isolated_settings) -> None:
+    _install_fake_voice(isolated_settings, isolated_settings.tts_voice_english, with_config=False)
+    with pytest.raises(TTSUnavailableError) as excinfo:
+        PiperTTS(isolated_settings).synthesize("Hello", "english")
+    assert "download_voices" in excinfo.value.user_message
+
+
+def test_a_corrupt_voice_model_degrades_instead_of_crashing(isolated_settings) -> None:
+    """Un .onnx illisible ne doit jamais remonter une erreur brute (§36)."""
+    pytest.importorskip("piper")
+    _install_fake_voice(isolated_settings, isolated_settings.tts_voice_english)
+
+    provider = PiperTTS(isolated_settings)
+    assert provider.voice_path("english") is not None
+    with pytest.raises(LilianaError):
+        provider.synthesize("Hello", "english")
 
 
 def test_null_tts_degrades_gracefully() -> None:

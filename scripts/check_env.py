@@ -69,7 +69,8 @@ def _check_llm() -> bool:
     status = get_llm_provider().status()
 
     if status.available:
-        print(f"{OK} Ollama is running with model '{status.model}'")
+        origin = " (chosen automatically)" if status.detail == "auto-selected" else ""
+        print(f"{OK} Ollama is running with model '{status.model}'{origin}")
         return True
 
     print(f"{KO} {status.detail}")
@@ -119,6 +120,19 @@ def _check_tts() -> bool:
     return available
 
 
+def _check_phonetics() -> bool:
+    """L'analyse phonétique de la prononciation dépend d'espeak-ng (piper-tts)."""
+    from app.language import phonemes
+
+    available = phonemes.is_available()
+    if available:
+        print(f"{OK} Phonetic analysis: espeak-ng ready (sound-by-sound feedback)")
+    else:
+        print(f"{KO} Phonetic analysis unavailable: pip install piper-tts")
+        print(f"{INFO} Pronunciation practice falls back to comparing words.")
+    return available
+
+
 def _check_storage() -> bool:
     settings = get_settings()
     try:
@@ -158,6 +172,7 @@ def main() -> int:
     llm_ok = _check_llm()
     stt_ok = _check_stt()
     _check_tts()  # jamais bloquant : Liliana peut répondre en texte
+    _check_phonetics()  # jamais bloquant : l'analyse retombe sur l'orthographe
 
     _title("Local storage")
     storage_ok = _check_storage()

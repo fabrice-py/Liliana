@@ -85,8 +85,11 @@ The conversation stays a conversation. The correction is recorded either way.
 - Exercises generated on the topics you actually get wrong: multiple choice,
   fill in the blank, conjugation, sentence correction, transformation,
   translation, sentence building.
-- Pronunciation practice: Liliana compares the sentence you were given with
-  what the recogniser actually heard, and names the sound to work on.
+- **Pronunciation practice with real phonetic analysis**: Liliana gives you a
+  sentence, converts both it and what she heard into IPA phonemes, aligns them,
+  and names the exact sound to work on — the German Ö pronounced as an O, the
+  TH turned into an S. She also uses the recogniser's per-word confidence, so
+  a word that is technically right but mumbled still shows up.
 
 **Memory and progress**
 - A placement test on first launch, per language.
@@ -179,21 +182,33 @@ cp .env.example .env               # Windows: copy .env.example .env
 
 1. Install Ollama from [ollama.com/download](https://ollama.com/download).
 2. Start it: `ollama serve` (on Windows it starts by itself after install).
-3. Pull a model sized for your machine — see [Models](#models) below.
-4. Put its name in `.env`:
+3. Pull a model sized for your machine — see [Models](#models) below:
 
-   ```env
-   LLM_MODEL=qwen2.5:3b-instruct
+   ```bash
+   ollama pull qwen2.5:3b-instruct
    ```
 
-### 4. Check everything
+**You do not need to edit `.env`.** Liliana picks the most suitable model among
+the ones you have installed: it skips embedding, code and vision models, prefers
+`instruct` variants, and avoids anything too large for your memory. The choice
+is logged and shown in the interface, never silent. Set `LLM_MODEL` only if you
+want to force a specific one.
+
+### 4. Prepare everything in one command
+
+```bash
+python scripts/setup.py --pull-model
+```
+
+It creates your `.env`, downloads a language model if none is installed,
+pre-downloads the speech model so your first recording is not slow, fetches the
+Piper voices, and reports anything still missing. Safe to re-run.
+
+To check without downloading anything:
 
 ```bash
 python scripts/check_env.py     # or: run.bat --check  /  ./start_liliana --check
 ```
-
-It inspects your CPU, RAM and GPU, recommends model sizes, and tells you
-exactly what is still missing and how to fix it.
 
 ---
 
@@ -219,16 +234,19 @@ ollama pull qwen2.5:3b-instruct     # good default on a laptop without a GPU
 **Speech-to-text** — downloaded automatically on your first recording, into
 `models/whisper/`. Set the size with `STT_MODEL` in `.env`.
 
-**Speech synthesis** — Piper voices go in `models/piper/`:
+**Speech synthesis and phonetics** — `piper-tts` (installed with the
+requirements) provides two things: Liliana's voice, and the espeak-ng engine
+that converts text to IPA phonemes for pronunciation analysis. The voices
+themselves go in `models/piper/`:
 
 ```bash
 python scripts/download_voices.py            # the voices named in your .env
 python scripts/download_voices.py --list     # a few well-tested alternatives
 ```
 
-You also need Piper itself, either as a Python module (`pip install piper-tts`)
-or as the `piper` executable on your `PATH`. **Without it Liliana still works** —
-she answers in text instead of speaking.
+The `piper` executable on your `PATH` works as an alternative to the Python
+module. **Without either, Liliana still works** — she answers in text, and
+pronunciation practice compares words instead of sounds.
 
 No GPU is required anywhere. Everything runs on CPU, just more slowly.
 
@@ -241,7 +259,7 @@ through the code. The ones you are most likely to touch:
 
 | Variable | Default | What it does |
 |---|---|---|
-| `LLM_MODEL` | *(empty)* | Ollama model name. **Set this.** |
+| `LLM_MODEL` | *(empty)* | Ollama model name. Leave empty to auto-select. |
 | `STT_MODEL` | `base` | Whisper size: `tiny`…`large-v3` |
 | `TTS_PROVIDER` | `piper` | `none` disables voice output entirely |
 | `DEFAULT_LANGUAGE` | `english` | `english` or `german` |
@@ -282,6 +300,10 @@ python run.py --check         # environment check, then exit
    your level per language.
 3. Press **Speak** (or the space bar) and talk.
 4. With *Hands-free* on, just stop talking; Liliana takes it from there.
+
+The tabs across the top hold the rest: **Exercises** (drills on the mistakes you
+actually make), **Vocabulary** (spaced repetition), **Pronunciation** (read a
+sentence aloud and see, sound by sound, what came out), and **Progress**.
 
 The status chip in the corner shows `● LOCAL` when everything is running.
 Click it for details on each engine.
@@ -339,16 +361,19 @@ liliana/
 │   ├── ai/                   LLM abstraction, prompts, tutor, JSON parsing
 │   ├── speech/               speech-to-text, synthesis, VAD, audio helpers
 │   ├── language/             correction, grammar, vocabulary, pronunciation,
-│   │                         placement test, voice commands, language data
+│   │                         phonemes, placement test, voice commands,
+│   │                         language data
 │   ├── learning/             progress, spaced repetition, lesson planner
 │   ├── database/             schema, connection, repositories
 │   └── api/routes.py         HTTP endpoints
 │
 ├── frontend/                 interface (HTML, CSS, one JS file)
+│                             tabs: conversation, exercises, vocabulary,
+│                             pronunciation, progress
 ├── models/                   Whisper and Piper models (not in Git)
 ├── data/                     SQLite database (not in Git)
 ├── logs/                     application log
-├── scripts/                  check_env.py, download_voices.py
+├── scripts/                  setup.py, check_env.py, download_voices.py
 ├── tests/                    pytest suite
 └── docs/                     architecture and design notes
 ```
@@ -404,7 +429,6 @@ current version:
 
 - more languages (French, Spanish, Italian, Japanese) — add an entry to
   `app/language/languages.py` and a voice;
-- forced phonetic alignment for real pronunciation scoring;
 - a wake word, so you do not need the button at all;
 - importing your own documents and books as learning material;
 - job-interview practice, exam preparation, professional and travel modes.

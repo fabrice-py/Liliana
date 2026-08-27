@@ -19,10 +19,22 @@ registering it:
 _PROVIDERS: dict[str, type[LLMProvider]] = {"ollama": OllamaProvider}
 ```
 
-The model name is **never** hardcoded. `LLM_MODEL` starts empty in
-`.env.example`; `scripts/check_env.py` recommends a size for your machine and
-lists what Ollama already has. An empty `LLM_MODEL` produces an explicit error
-telling you what to do, not a crash.
+The model name is **never** hardcoded, and it does not have to be configured
+either. `LLM_MODEL` starts empty; when it is empty, `resolve_model()` asks
+Ollama what is installed and scores the candidates:
+
+- models that are not for conversation are excluded outright — anything matching
+  `embed`, `rerank`, `code`, `vision`, `llava`, `guard`, `math`;
+- known-good multilingual families score higher (qwen, llama, mistral, gemma…);
+- `instruct` / `chat` variants beat their base counterparts;
+- size is scored against the machine's memory: bigger is better up to about a
+  third of the budget, then penalised — a 70B on 8 GB technically runs, and is
+  unusable.
+
+The chosen model is logged, and `/api/health` reports `auto-selected` so the
+interface can show which one is in use. It is a default, not a lock: setting
+`LLM_MODEL` always wins. With nothing usable installed, the error names the
+`ollama pull` command to run.
 
 ## The system prompt
 

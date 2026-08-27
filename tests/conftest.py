@@ -103,20 +103,38 @@ class FakeSTT(STTProvider):
         super().__init__()
         self.text = text
         self.calls = 0
+        #: Probabilité acoustique attribuée à chaque mot quand on la demande.
+        self.word_probability = 0.9
 
-    def transcribe(self, audio: bytes, language: str | None = None):  # noqa: ANN001
+    def transcribe(
+        self, audio: bytes, language: str | None = None, word_timestamps: bool = False
+    ):  # noqa: ANN001
         from app.core.exceptions import EmptyTranscriptionError
         from app.speech.stt import Transcription
 
         self.calls += 1
         if not audio:
             raise EmptyTranscriptionError("empty")
+        words = []
+        if word_timestamps:
+            tokens = self.text.split()
+            step = 2.0 / max(1, len(tokens))
+            words = [
+                {
+                    "word": token.strip(".,!?"),
+                    "start": round(index * step, 2),
+                    "end": round((index + 1) * step, 2),
+                    "probability": self.word_probability,
+                }
+                for index, token in enumerate(tokens)
+            ]
         return Transcription(
             text=self.text,
             language=(language or "english")[:2],
             language_probability=0.99,
             duration=2.0,
             elapsed=0.05,
+            words=words,
         )
 
     def is_available(self):

@@ -27,6 +27,59 @@ from app.core.logger import get_logger
 logger = get_logger(__name__)
 
 
+#: Familles de modèles qui tiennent correctement une conversation multilingue et
+#: respectent un format JSON. Score plus élevé = préféré à l'auto-sélection.
+_FAMILY_PREFERENCE: tuple[tuple[str, int], ...] = (
+    ("qwen", 40), ("llama", 35), ("mistral", 30), ("gemma", 28),
+    ("phi", 22), ("granite", 20), ("command-r", 18), ("aya", 25),
+)
+
+#: Modèles à ne jamais choisir automatiquement : ils ne servent pas à discuter.
+_EXCLUDED_MODEL_MARKERS: tuple[str, ...] = (
+    "embed", "rerank", "code", "vision", "moondream", "llava", "guard", "math",
+)
+
+
+def _parameter_billions(details: dict[str, Any]) -> float:
+    """Taille du modèle en milliards de paramètres, 0.0 si inconnue."""
+    raw = str(details.get("parameter_size") or "").strip().upper()
+    if not raw:
+        return 0.0
+    try:
+        if raw.endswith("B"):
+            return float(raw[:-1])
+        if raw.endswith("M"):
+            return float(raw[:-1]) / 1000
+    except ValueError:
+        pass
+    return 0.0
+
+
+def score_model(name: str, details: dict[str, Any], budget_gb: float) -> float:
+    """Note un modèle installé pour l'auto-sélection. Négatif = à écarter."""
+    lowered = name.lower()
+    if any(marker in lowered for marker in _EXCLUDED_MODEL_MARKERS):
+        return -1.0
+
+    score = 0.0
+    for family, bonus in _FAMILY_PREFERENCE:
+        if family in lowered:
+            score += bonus
+            break
+    if "instruct" in lowered or "chat" in lowered or "-it" in lowered:
+        score += 25
+
+    # Le plus gros modèle qui tient confortablement en mémoire. Au-delà d'un
+    # tiers du budget, la latence devient pénible sur une machine sans GPU.
+    billions = _parameter_billions(details)
+    if billions:
+        comfortable = max(1.0, budget_gb / 3.0)
+        score += 20 * min(billions / comfortable, 1.0)
+        if billions > comfortable * 2:
+            score -= 15  # trop gros : ça tournera, mais très lentement
+    return score
+
+
 @dataclass(slots=True)
 class LLMStatus:
     """État du backend LLM, affiché dans l'interface."""
@@ -78,10 +131,63 @@ class OllamaProvider(LLMProvider):
         self.base_url = self.settings.llm_base_url.rstrip("/")
         self.model = self.settings.llm_model.strip()
         self.timeout = self.settings.llm_timeout
+        #: Vrai quand le modèle a été choisi automatiquement faute de LLM_MODEL.
+        self.auto_selected = False
+
+    # -------------------------------------------------- sélection du modèle
+    def _installed(self) -> list[dict[str, Any]]:
+        """Modèles présents dans Ollama. Liste vide s'il est injoignable."""
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                response = client.get(f"{self.base_url}/api/tags")
+                response.raise_for_status()
+                models = response.json().get("models", [])
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
+            return []
+        return [model for model in models if isinstance(model, dict) and model.get("name")]
+
+    def resolve_model(self) -> str:
+        """Modèle à utiliser, choisi automatiquement si la configuration est vide.
+
+        Devoir éditer ``.env`` avant la première phrase est le principal point de
+        friction à l'installation. Si un seul modèle convenable est installé,
+        autant s'en servir — le choix est journalisé et affiché dans l'interface,
+        jamais silencieux.
+        """
+        if self.model:
+            return self.model
+
+        installed = self._installed()
+        if not installed:
+            return ""
+
+        from app.core.hardware import detect_hardware
+
+        hardware = detect_hardware()
+        budget = hardware.vram_gb if (hardware.has_cuda and hardware.vram_gb) else hardware.total_ram_gb
+
+        ranked = sorted(
+            (
+                (score_model(str(model["name"]), model.get("details") or {}, budget), str(model["name"]))
+                for model in installed
+            ),
+            reverse=True,
+        )
+        best = next((name for score, name in ranked if score >= 0), "")
+        if best:
+            self.model = best
+            self.auto_selected = True
+            logger.info(
+                "LLM_MODEL non renseigné : sélection automatique de '%s' "
+                "parmi %d modèle(s) installé(s)",
+                best,
+                len(installed),
+            )
+        return best
 
     # ------------------------------------------------------------- interne
     def _require_model(self) -> str:
-        if not self.model:
+        if not self.resolve_model():
             raise ConfigurationError(
                 "LLM_MODEL is empty",
                 user_message=(
@@ -188,12 +294,15 @@ class OllamaProvider(LLMProvider):
             )
 
         installed = tuple(str(tag.get("name", "")) for tag in tags)
-        if not self.model:
+        if not self.resolve_model():
             return LLMStatus(
                 available=False,
                 provider=self.name,
                 model="",
-                detail="No model configured. Set LLM_MODEL in your .env file.",
+                detail=(
+                    "Ollama is running but has no usable conversational model. "
+                    "Install one, for example `ollama pull qwen2.5:3b-instruct`."
+                ),
                 installed_models=installed,
             )
         # Ollama tolère `llama3` pour `llama3:latest` : on compare sans le tag.
@@ -210,7 +319,7 @@ class OllamaProvider(LLMProvider):
             available=True,
             provider=self.name,
             model=self.model,
-            detail="ready",
+            detail="auto-selected" if self.auto_selected else "ready",
             installed_models=installed,
         )
 

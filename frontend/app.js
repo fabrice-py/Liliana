@@ -21,7 +21,10 @@ const state = {
   vad: { silence_threshold: 0.8, energy_threshold: 0.015, min_speech_duration: 0.3 },
 };
 
-const media = { stream: null, recorder: null, chunks: [], audioContext: null, analyser: null, raf: 0 };
+const media = {
+  stream: null, recorder: null, chunks: [], audioContext: null, analyser: null, raf: 0,
+  onBlob: null, levelBarId: 'level-bar',
+};
 
 /* ------------------------------------------------------------ utilitaires */
 
@@ -345,7 +348,8 @@ function startVad(onSilence) {
       sum += centred * centred;
     }
     const rms = Math.sqrt(sum / buffer.length);
-    $('level-bar').style.width = `${Math.min(100, rms * 450)}%`;
+    const meter = $(media.levelBarId || 'level-bar');
+    if (meter) meter.style.width = `${Math.min(100, rms * 450)}%`;
 
     const now = performance.now();
     if (rms >= state.vad.energy_threshold) {
@@ -371,7 +375,8 @@ function startVad(onSilence) {
 
 function stopVad() {
   cancelAnimationFrame(media.raf);
-  $('level-bar').style.width = '0%';
+  const meter = $(media.levelBarId || 'level-bar');
+  if (meter) meter.style.width = '0%';
   if (media.audioContext) {
     media.audioContext.close().catch(() => {});
     media.audioContext = null;
@@ -380,8 +385,10 @@ function stopVad() {
 
 /* ------------------------------------------------------------ tour vocal */
 
-async function startRecording() {
+async function startRecording(handler = sendVoiceTurn, levelBarId = 'level-bar') {
   if (state.recording || state.busy) return;
+  media.onBlob = handler;
+  media.levelBarId = levelBarId;
   try {
     await ensureMicrophone();
   } catch (error) {
@@ -410,7 +417,7 @@ async function startRecording() {
       toast('That recording was too short — try speaking a little longer.');
       return;
     }
-    sendVoiceTurn(blob);
+    (media.onBlob || sendVoiceTurn)(blob);
   };
 
   media.recorder.start();
@@ -928,6 +935,187 @@ function renderLanguageCard(entry) {
   return card;
 }
 
+/* ------------------------------------------------------- prononciation */
+
+const pronunciation = { sentence: '', category: '', phoneticAnalysis: true };
+
+async function loadPronunciationSentence() {
+  const category = $('sound-select').value;
+  const target = $('target-sentence');
+  target.textContent = 'Choosing a sentence…';
+  try {
+    const params = new URLSearchParams({ language: state.language });
+    if (category) params.set('category', category);
+    if (pronunciation.sentence) params.set('exclude', pronunciation.sentence);
+
+    const data = await request(`/pronunciation/sentence?${params}`);
+    pronunciation.sentence = data.sentence;
+    pronunciation.category = data.category;
+    pronunciation.phoneticAnalysis = data.phonetic_analysis;
+
+    target.textContent = data.sentence;
+    $('sound-label').textContent = data.targeted
+      ? `Read this aloud — ${data.category} (picked from your past attempts)`
+      : `Read this aloud — ${data.category}`;
+    $('pronunciation-hint').textContent = data.phonetic_analysis
+      ? 'Say it once, clearly.'
+      : 'Say it once. Install piper-tts for sound-by-sound analysis.';
+
+    fillSoundOptions(data.categories, category);
+  } catch (error) {
+    target.textContent = '—';
+    toast(error.message);
+  }
+}
+
+function fillSoundOptions(categories, selected) {
+  const select = $('sound-select');
+  if (select.dataset.language === state.language) return;
+  select.innerHTML = '';
+  select.add(new Option('Target my weak sounds', ''));
+  for (const category of categories) select.add(new Option(category, category));
+  select.value = selected || '';
+  select.dataset.language = state.language;
+}
+
+function togglePronunciationRecording() {
+  const button = $('record-pronunciation');
+  if (state.recording) {
+    stopRecording();
+    button.classList.remove('recording');
+    button.textContent = '🎙 Record';
+    return;
+  }
+  if (!pronunciation.sentence) { toast('No sentence to read yet.'); return; }
+  button.classList.add('recording');
+  button.textContent = '⏹ Stop';
+  startRecording(checkPronunciation, 'pronunciation-level');
+}
+
+async function checkPronunciation(blob) {
+  const button = $('record-pronunciation');
+  button.classList.remove('recording');
+  button.textContent = '🎙 Record';
+
+  const area = $('pronunciation-result');
+  area.innerHTML = '<p class="muted">Listening back…</p>';
+
+  const form = new FormData();
+  form.append('audio', blob, 'read.webm');
+  form.append('expected', pronunciation.sentence);
+  form.append('language', state.language);
+
+  try {
+    const result = await postForm('/pronunciation/check', form);
+    area.innerHTML = '';
+    area.appendChild(renderPronunciationResult(result));
+  } catch (error) {
+    area.innerHTML = '';
+    toast(error.message);
+  }
+}
+
+function scoreClass(score) {
+  return score >= 80 ? 'score-good' : score >= 55 ? 'score-mid' : 'score-poor';
+}
+
+function renderPronunciationResult(result) {
+  const card = document.createElement('div');
+  card.className = 'card';
+
+  // --- note et sa décomposition, pour qu'aucun chiffre ne sorte de nulle part
+  const ring = document.createElement('div');
+  ring.className = 'score-ring';
+  const big = document.createElement('div');
+  big.className = `big ${scoreClass(result.score)}`;
+  big.textContent = Math.round(result.score);
+
+  const breakdown = document.createElement('div');
+  breakdown.className = 'breakdown';
+  const rows = [['Words recognised', result.word_accuracy]];
+  if (result.phoneme_accuracy !== null) rows.push(['Sounds correct', result.phoneme_accuracy]);
+  if (result.acoustic_confidence !== null) rows.push(['Clarity', result.acoustic_confidence]);
+  for (const [label, value] of rows) {
+    const row = document.createElement('div');
+    row.innerHTML = '<span></span> <b></b>';
+    row.querySelector('span').textContent = `${label}:`;
+    row.querySelector('b').textContent = `${Math.round(value)}%`;
+    breakdown.appendChild(row);
+  }
+  ring.append(big, breakdown);
+  card.appendChild(ring);
+
+  const feedback = document.createElement('p');
+  feedback.textContent = result.feedback;
+  card.appendChild(feedback);
+
+  // --- mot à mot : ce que Liliana a réellement entendu
+  const map = document.createElement('div');
+  map.className = 'word-map';
+  for (const word of result.words) {
+    if (!word.expected) continue;
+    const chip = document.createElement('span');
+    const shaky = word.ok && word.confidence !== null && word.confidence < 0.6;
+    chip.className = `w ${!word.ok ? (word.heard ? 'wrong' : 'missing') : shaky ? 'shaky' : 'ok'}`;
+    chip.textContent = word.expected;
+    if (!word.ok && word.heard) {
+      const heard = document.createElement('span');
+      heard.className = 'heard';
+      heard.textContent = `heard “${word.heard}”`;
+      chip.appendChild(heard);
+    }
+    if (shaky) chip.title = `Recognised, but unclear (${Math.round(word.confidence * 100)}%)`;
+    map.appendChild(chip);
+  }
+  card.appendChild(map);
+
+  // --- écarts phonétiques
+  if (result.phoneme_diffs && result.phoneme_diffs.length) {
+    const diffs = document.createElement('div');
+    diffs.className = 'phoneme-diffs';
+    const seen = new Set();
+    for (const diff of result.phoneme_diffs) {
+      const key = `${diff.expected}>${diff.heard}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const chip = document.createElement('span');
+      chip.className = 'pd';
+      chip.innerHTML = '<code></code> → <code></code> <em></em>';
+      const codes = chip.querySelectorAll('code');
+      codes[0].textContent = diff.expected || '∅';
+      codes[1].textContent = diff.heard || '∅';
+      chip.querySelector('em').textContent = diff.label;
+      diffs.appendChild(chip);
+    }
+    card.appendChild(diffs);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'answer-row';
+  const again = document.createElement('button');
+  again.className = 'ghost';
+  again.textContent = 'Try the same sentence again';
+  again.addEventListener('click', togglePronunciationRecording);
+  const next = document.createElement('button');
+  next.className = 'primary';
+  next.textContent = 'Next sentence';
+  next.addEventListener('click', () => {
+    $('pronunciation-result').innerHTML = '';
+    loadPronunciationSentence();
+  });
+  actions.append(again, next);
+  card.appendChild(actions);
+
+  const note = document.createElement('p');
+  note.className = 'method-note';
+  note.textContent = result.method.startsWith('phonemes')
+    ? 'Scored by comparing the sounds you produced with the sounds expected.'
+    : 'Scored by comparing words only — install piper-tts for sound-by-sound analysis.';
+  card.appendChild(note);
+
+  return card;
+}
+
 /* --------------------------------------------------------------- modals */
 
 function openModal(title, build) {
@@ -1146,6 +1334,7 @@ function switchTab(name) {
   });
   if (name === 'progress') loadProgress();
   if (name === 'vocabulary') loadVocabulary();
+  if (name === 'pronunciation' && !pronunciation.sentence) loadPronunciationSentence();
 }
 
 async function persistSettings() {
@@ -1208,6 +1397,10 @@ async function boot() {
     await persistSettings();
     $('conversation').innerHTML = '';
     await loadConversation();
+    pronunciation.sentence = '';
+    $('sound-select').dataset.language = '';
+    $('pronunciation-result').innerHTML = '';
+    if (document.querySelector('#panel-pronunciation.active')) loadPronunciationSentence();
   });
   modeSelect.addEventListener('change', async () => {
     state.mode = modeSelect.value;
@@ -1243,6 +1436,16 @@ async function boot() {
   $('load-vocabulary').addEventListener('click', loadVocabulary);
   $('teach-vocabulary').addEventListener('click', teachVocabulary);
   $('refresh-progress').addEventListener('click', loadProgress);
+  $('next-sentence').addEventListener('click', () => {
+    $('pronunciation-result').innerHTML = '';
+    loadPronunciationSentence();
+  });
+  $('sound-select').addEventListener('change', () => {
+    $('pronunciation-result').innerHTML = '';
+    loadPronunciationSentence();
+  });
+  $('hear-sentence').addEventListener('click', () => speakText(pronunciation.sentence));
+  $('record-pronunciation').addEventListener('click', togglePronunciationRecording);
   $('status-chip').addEventListener('click', showHealthDetails);
   $('modal-close').addEventListener('click', closeModal);
   $('modal-backdrop').addEventListener('click', (event) => {
@@ -1253,7 +1456,9 @@ async function boot() {
     // Espace = parler, sauf si l'on est en train d'écrire.
     if (event.code === 'Space' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName)) {
       event.preventDefault();
-      if (state.recording) stopRecording(); else startRecording();
+      if (document.querySelector('#panel-pronunciation.active')) togglePronunciationRecording();
+      else if (state.recording) stopRecording();
+      else startRecording();
     }
   });
 

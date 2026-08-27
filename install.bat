@@ -39,28 +39,19 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo   [3/4] Creation du fichier de configuration...
-if not exist ".env" (
-    copy ".env.example" ".env" >nul
-    echo        .env cree a partir de .env.example
-) else (
-    echo        .env existe deja, il est conserve
-)
-
-echo   [4/4] Telechargement des voix Piper...
-call .venv\Scripts\python.exe scripts\download_voices.py
+echo   [3/3] Preparation de Liliana (configuration, modeles, voix)...
+echo.
+call .venv\Scripts\python.exe scripts\setup.py --pull-model
 
 echo.
-echo   Verification de l'environnement :
-call .venv\Scripts\python.exe scripts\check_env.py
-
-echo.
-echo   Il reste probablement a installer le modele de langage :
+echo   Si un modele de langage manque encore :
 echo     1. Installez Ollama : https://ollama.com/download
-echo     2. Ouvrez une invite de commandes et lancez : ollama serve
-echo     3. Telechargez un modele, par exemple : ollama pull qwen2.5:3b-instruct
-echo     4. Renseignez LLM_MODEL=qwen2.5:3b-instruct dans le fichier .env
+echo     2. Lancez : ollama serve
+echo     3. Relancez install.bat
 echo.
-echo   Ensuite, lancez Liliana avec run.bat
+echo   Liliana choisit toute seule le modele installe le plus adapte :
+echo   il n'y a rien a editer dans .env.
+echo.
+echo   Pour demarrer : run.bat
 echo.
 pause

@@ -47,6 +47,7 @@
     <button class="tab active" data-tab="conversation" role="tab">Conversation</button>
     <button class="tab" data-tab="exercises" role="tab">Exercises</button>
     <button class="tab" data-tab="vocabulary" role="tab">Vocabulary</button>
+    <button class="tab" data-tab="pronunciation" role="tab">Pronunciation</button>
     <button class="tab" data-tab="progress" role="tab">Progress</button>
   </nav>
 
@@ -117,6 +118,27 @@
     <div id="vocabulary-area" class="card-list">
       <p class="muted">Words Liliana introduces during conversations land here automatically.</p>
     </div>
+  </section>
+
+  <!-- ----------------------------------------------------- pronunciation -->
+  <section class="panel" id="panel-pronunciation">
+    <div class="card-actions">
+      <select id="sound-select"><option value="">Target my weak sounds</option></select>
+      <button id="next-sentence" class="primary">Another sentence</button>
+    </div>
+
+    <div class="card" id="pronunciation-card">
+      <h3 id="sound-label">Read this aloud</h3>
+      <p class="prompt" id="target-sentence">Loading a sentence…</p>
+      <div class="answer-row">
+        <button id="hear-sentence" class="ghost">🔊 Hear it</button>
+        <button id="record-pronunciation" class="primary">🎙 Record</button>
+        <span class="muted small" id="pronunciation-hint">Say it once, clearly.</span>
+      </div>
+      <div class="level-meter" style="margin-top:12px"><div id="pronunciation-level"></div></div>
+    </div>
+
+    <div id="pronunciation-result" class="card-list"></div>
   </section>
 
   <!-- ---------------------------------------------------------- progress -->

@@ -144,16 +144,39 @@ rather than slicing everything too thin.
 
 ## Pronunciation
 
-`app/language/pronunciation.py` compares a sentence you were asked to read with
-what the recogniser actually heard. If Whisper hears "sink" where the text said
-"think", that is real evidence about your TH.
+You are given a sentence to read. Liliana transcribes what you actually said and
+compares the two on three independent axes.
 
-The comparison aligns words with a longest-common-subsequence diff, scores 60 %
-word accuracy and 40 % character similarity, and maps the substitutions to named
-sounds: the English TH, the V/W distinction, the German Umlauts, the ich-Laut
-and ach-Laut, and so on. Near-misses are analysed too — `möchte` heard as
-`mochte` scores well but still flags the Ö.
+**Phonemes** (`app/language/phonemes.py`). Both sentences are converted to IPA
+by espeak-ng — bundled inside `piper-tts`, so no system package and no network —
+then aligned. This is the axis that carries the diagnosis:
 
-This is not forced phonetic alignment, and the module says so. It needs no
-extra model, it runs on the transcription you already have, and it is isolated
-behind one function so a real aligner can replace it later.
+```
+expected  Ich möchte      →  ɪç mœçtə
+heard     Ich mochte      →  ɪç mɔxtə
+                              ─┬─ ─┬─
+                               │   └── ç → x   the German CH
+                               └────── œ → ɔ   the German Ö versus O
+```
+
+A spelling comparison sees one word off by an accent. The phoneme alignment sees
+two distinct sounds missed, and can name both.
+
+**Words.** A longest-common-subsequence alignment over the words, so a dropped
+or swapped word is reported as such rather than smeared across the sentence.
+
+**Acoustic confidence.** With `word_timestamps=True`, Whisper returns a
+probability per word. A word recognised correctly but with low confidence was
+mumbled — invisible to any text comparison. Requested only here, since the
+extra decoding cost is not worth it on ordinary conversation turns.
+
+The score is a weighted mean of whichever signals are actually available
+(phonemes 0.50, words 0.30, clarity 0.20, renormalised), and `method` on the
+result says which ones were used, so no number appears out of nowhere. Without
+`piper-tts` the phoneme axis drops out and character similarity takes its place:
+degraded, still useful, and honestly labelled in the interface.
+
+Practice sentences come from a local bank, each saturated with one sound. The
+choice is driven by the sounds you have actually missed before — the same
+adaptive loop as the grammar drills — and rotates so you do not read the same
+line twice.

@@ -19,10 +19,15 @@ httpx>=0.27,<1.0             # appels HTTP vers Ollama, avec streaming
 # aucun ffmpeg système à installer.
 faster-whisper>=1.0.3,<2.0
 
-# --- Synthèse vocale locale -------------------------------------------------
-# Optionnel : Liliana fonctionne sans (elle répond alors en texte seul) et
-# accepte aussi l'exécutable `piper` du PATH. Décommentez pour la voie Python.
-# piper-tts>=1.2.0
+# --- Synthèse vocale ET analyse phonétique locales ---------------------------
+# Fournit deux choses :
+#  1. la voix de Liliana ;
+#  2. espeak-ng embarqué, qui convertit le texte en phonèmes IPA — c'est ce qui
+#     permet de dire « votre Ö est prononcé O » plutôt que de comparer des
+#     lettres (voir app/language/phonemes.py).
+# Liliana fonctionne sans (voix coupée, analyse phonétique dégradée en
+# comparaison orthographique), mais l'expérience est nettement moins bonne.
+piper-tts>=1.2.0
 
 # --- Tests ------------------------------------------------------------------
 pytest>=8.0

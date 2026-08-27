@@ -51,6 +51,7 @@ class Language:
     english_name: str    # nom affiché
     native_name: str
     whisper_code: str    # code ISO-639-1 attendu par Whisper
+    espeak_voice: str    # voix espeak-ng, pour la phonémisation (analyse de prononciation)
     flag: str
     is_target: bool      # langue enseignée (vs langue d'appui)
     error_types: tuple[str, ...]
@@ -97,6 +98,7 @@ LANGUAGES: dict[str, Language] = {
         english_name="English",
         native_name="English",
         whisper_code="en",
+        espeak_voice="en-us",
         flag="🇬🇧",
         is_target=True,
         error_types=_COMMON_ERRORS,
@@ -107,6 +109,7 @@ LANGUAGES: dict[str, Language] = {
         english_name="German",
         native_name="Deutsch",
         whisper_code="de",
+        espeak_voice="de",
         flag="🇩🇪",
         is_target=True,
         error_types=_COMMON_ERRORS + _GERMAN_ERRORS,
@@ -118,6 +121,7 @@ LANGUAGES: dict[str, Language] = {
         english_name="French",
         native_name="Français",
         whisper_code="fr",
+        espeak_voice="fr",
         flag="🇫🇷",
         is_target=False,
         error_types=_COMMON_ERRORS,
@@ -146,3 +150,7 @@ def error_types_for(code: str) -> tuple[str, ...]:
 
 def whisper_code(code: str) -> str:
     return get_language(code).whisper_code
+
+
+def espeak_voice(code: str) -> str:
+    return get_language(code).espeak_voice

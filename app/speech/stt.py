@@ -42,6 +42,10 @@ class Transcription:
     duration: float        # durée de l'audio, en secondes
     elapsed: float         # temps de transcription, en secondes
     segments: list[dict[str, Any]] = field(default_factory=list)
+    #: Mots horodatés avec leur probabilité acoustique. Rempli uniquement quand
+    #: la transcription est demandée avec ``word_timestamps=True`` (analyse de
+    #: prononciation) : le calcul coûte du temps, inutile en conversation.
+    words: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -71,8 +75,14 @@ class STTProvider(ABC):
         self.settings = settings or get_settings()
 
     @abstractmethod
-    def transcribe(self, audio: bytes, language: str | None = None) -> Transcription:
-        """Transcrit un fichier audio (n'importe quel format lisible par ffmpeg)."""
+    def transcribe(
+        self, audio: bytes, language: str | None = None, word_timestamps: bool = False
+    ) -> Transcription:
+        """Transcrit un fichier audio (n'importe quel format lisible par ffmpeg).
+
+        ``word_timestamps`` demande le détail mot à mot avec la probabilité
+        acoustique de chacun — la matière première de l'analyse de prononciation.
+        """
 
     @abstractmethod
     def is_available(self) -> tuple[bool, str]:
@@ -148,7 +158,9 @@ class FasterWhisperSTT(STTProvider):
             return self._model
 
     # -------------------------------------------------------------- public
-    def _decode(self, audio: bytes, language: str | None) -> tuple[Any, Any]:
+    def _decode(
+        self, audio: bytes, language: str | None, word_timestamps: bool = False
+    ) -> tuple[Any, Any]:
         """Lance le décodage. Retourne (générateur de segments, informations)."""
         if not audio:
             raise EmptyTranscriptionError("empty audio payload")
@@ -165,6 +177,7 @@ class FasterWhisperSTT(STTProvider):
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 300},
                 condition_on_previous_text=False,
+                word_timestamps=word_timestamps,
             )
         except Exception as exc:  # noqa: BLE001 - PyAV/CTranslate2 lèvent large
             raise STTError(
@@ -176,7 +189,10 @@ class FasterWhisperSTT(STTProvider):
             ) from exc
 
     def transcribe_stream(
-        self, audio: bytes, language: str | None = None
+        self,
+        audio: bytes,
+        language: str | None = None,
+        word_timestamps: bool = False,
     ) -> Iterator[TranscriptionEvent]:
         """Émet le texte au fil du décodage, puis la transcription complète.
 
@@ -186,14 +202,26 @@ class FasterWhisperSTT(STTProvider):
         """
         started = time.perf_counter()
         forced_code = whisper_code(language) if language else None
-        segments, info = self._decode(audio, language)
+        segments, info = self._decode(audio, language, word_timestamps)
 
         collected: list[dict[str, Any]] = []
+        words: list[dict[str, Any]] = []
         try:
             for segment in segments:
                 collected.append(
                     {"start": segment.start, "end": segment.end, "text": segment.text}
                 )
+                for word in getattr(segment, "words", None) or ():
+                    words.append(
+                        {
+                            "word": word.word.strip(),
+                            "start": float(word.start),
+                            "end": float(word.end),
+                            # Confiance acoustique du modèle sur ce mot précis :
+                            # basse = « j'ai entendu quelque chose d'approchant ».
+                            "probability": float(getattr(word, "probability", 0.0) or 0.0),
+                        }
+                    )
                 partial = " ".join(item["text"].strip() for item in collected).strip()
                 if partial:
                     yield TranscriptionEvent(text=partial)
@@ -220,13 +248,16 @@ class FasterWhisperSTT(STTProvider):
                 duration=float(getattr(info, "duration", 0.0) or 0.0),
                 elapsed=time.perf_counter() - started,
                 segments=collected,
+                words=words,
             ),
         )
 
-    def transcribe(self, audio: bytes, language: str | None = None) -> Transcription:
+    def transcribe(
+        self, audio: bytes, language: str | None = None, word_timestamps: bool = False
+    ) -> Transcription:
         """Transcription complète, en consommant le flux jusqu'au bout."""
         final: Transcription | None = None
-        for event in self.transcribe_stream(audio, language):
+        for event in self.transcribe_stream(audio, language, word_timestamps):
             if event.is_final:
                 final = event.transcription
         if final is None:  # pragma: no cover - transcribe_stream lève avant

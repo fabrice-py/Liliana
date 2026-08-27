@@ -324,12 +324,14 @@ def test_pronunciation_check_scores_the_attempt(client, user_id: int) -> None:
         data={"expected": "I think this is fine", "language": "english"},
     ).json()
     assert payload["score"] < 100
-    assert "the English TH sound" in payload["problem_sounds"]
+    assert any("TH" in sound for sound in payload["problem_sounds"])
     assert payload["transcription"]["text"] == "I sink dis is fine"
 
 
 def test_pronunciation_perfect_reading_scores_full(client) -> None:
+    """Mots justes ET confiance acoustique maximale : la note est parfaite."""
     client.fake_stt.text = "I think this is fine"
+    client.fake_stt.word_probability = 1.0
     payload = client.post(
         "/api/pronunciation/check",
         files={"audio": ("t.webm", b"x" * 500, "audio/webm")},
@@ -337,6 +339,35 @@ def test_pronunciation_perfect_reading_scores_full(client) -> None:
     ).json()
     assert payload["score"] == 100.0
     assert payload["problem_sounds"] == []
+    assert payload["phoneme_accuracy"] == 100.0
+
+
+def test_hesitant_delivery_costs_points(client) -> None:
+    """Les bons mots prononcés sans assurance ne valent pas une lecture nette.
+
+    C'est la raison d'être du signal acoustique : la comparaison de texte seule
+    ne peut pas distinguer les deux.
+    """
+    client.fake_stt.text = "I think this is fine"
+
+    client.fake_stt.word_probability = 1.0
+    confident = client.post(
+        "/api/pronunciation/check",
+        files={"audio": ("t.webm", b"x" * 500, "audio/webm")},
+        data={"expected": "I think this is fine."},
+    ).json()
+
+    client.fake_stt.word_probability = 0.35
+    hesitant = client.post(
+        "/api/pronunciation/check",
+        files={"audio": ("t.webm", b"x" * 500, "audio/webm")},
+        data={"expected": "I think this is fine."},
+    ).json()
+
+    assert hesitant["score"] < confident["score"]
+    assert hesitant["acoustic_confidence"] == 35.0
+    # Les mots restent justes : seule la confiance acoustique les sépare.
+    assert hesitant["word_accuracy"] == confident["word_accuracy"]
 
 
 # --------------------------------------------------------------- évaluation
@@ -444,3 +475,72 @@ def test_user_message_is_kept_even_if_the_model_fails(client, user_id: int, monk
 def test_speak_endpoint_returns_audio(client) -> None:
     payload = client.post("/api/speak", json={"text": "Hello there", "speed": 0.8}).json()
     assert base64.b64decode(payload["audio_base64"]).startswith(b"RIFF")
+
+
+# ---------------------------------------- entraînement à la prononciation (§7)
+def test_pronunciation_sentence_is_served_without_a_model(client) -> None:
+    """La banque est locale : l'entraînement marche même si Ollama est éteint."""
+    payload = client.get("/api/pronunciation/sentence?language=german").json()
+    assert payload["sentence"]
+    assert payload["category"] in payload["categories"]
+    assert payload["targeted"] is False
+
+
+def test_pronunciation_sentence_honours_a_chosen_category(client) -> None:
+    payload = client.get(
+        "/api/pronunciation/sentence?language=english&category=TH"
+    ).json()
+    assert payload["category"] == "TH"
+    assert "th" in payload["sentence"].lower()
+
+
+def test_pronunciation_sentence_can_avoid_repeating_itself(client) -> None:
+    first = client.get("/api/pronunciation/sentence?language=english&category=TH").json()
+    second = client.get(
+        f"/api/pronunciation/sentence?language=english&category=TH"
+        f"&exclude={first['sentence']}"
+    ).json()
+    assert second["sentence"] != first["sentence"]
+
+
+def test_pronunciation_sentence_targets_recorded_weaknesses(client) -> None:
+    """Après des Ö ratés, Liliana propose d'elle-même une phrase en Ö."""
+    client.fake_stt.text = "Ich mochte ein Brotchen"
+    client.post(
+        "/api/pronunciation/check",
+        files={"audio": ("t.webm", b"x" * 500, "audio/webm")},
+        data={"expected": "Ich möchte ein Brötchen", "language": "german"},
+    )
+    payload = client.get("/api/pronunciation/sentence?language=german").json()
+    assert payload["targeted"] is True
+    assert payload["category"] == "Ö"
+
+
+def test_pronunciation_result_exposes_its_reasoning(client) -> None:
+    """La note doit être décomposable : rien ne sort d'un chiffre magique."""
+    client.fake_stt.text = "I sink dis is fine"
+    payload = client.post(
+        "/api/pronunciation/check",
+        files={"audio": ("t.webm", b"x" * 500, "audio/webm")},
+        data={"expected": "I think this is fine", "language": "english"},
+    ).json()
+
+    assert set(payload) >= {
+        "score", "word_accuracy", "phoneme_accuracy", "acoustic_confidence",
+        "phoneme_diffs", "problem_sounds", "words", "method", "feedback",
+    }
+    assert payload["acoustic_confidence"] is not None
+    assert all("expected" in word for word in payload["words"])
+
+
+def test_pronunciation_words_carry_their_confidence(client) -> None:
+    client.fake_stt.text = "I think this is fine"
+    client.fake_stt.word_probability = 0.4
+    payload = client.post(
+        "/api/pronunciation/check",
+        files={"audio": ("t.webm", b"x" * 500, "audio/webm")},
+        data={"expected": "I think this is fine", "language": "english"},
+    ).json()
+    recognised = [word for word in payload["words"] if word["ok"]]
+    assert recognised
+    assert all(word["confidence"] == 0.4 for word in recognised)
