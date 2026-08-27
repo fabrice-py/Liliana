@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Liliana — lancement sous Linux et macOS.
+#
+#     ./start_liliana              lance Liliana
+#     ./start_liliana --install    installe/actualise les dépendances d'abord
+#     ./start_liliana --check      vérifie l'environnement et s'arrête
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+PYTHON="${PYTHON:-python3}"
+VENV=".venv"
+
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+  echo "  Python 3 is required but was not found. Install Python 3.10 or newer." >&2
+  exit 1
+fi
+
+install_dependencies() {
+  echo "  Installing dependencies…"
+  "$VENV/bin/python" -m pip install --upgrade pip --quiet
+  "$VENV/bin/python" -m pip install -r requirements.txt
+  [ -f .env ] || { cp .env.example .env; echo "  .env created from .env.example"; }
+  "$VENV/bin/python" scripts/download_voices.py || true
+}
+
+if [ ! -d "$VENV" ]; then
+  echo "  Creating the virtual environment…"
+  "$PYTHON" -m venv "$VENV"
+  install_dependencies
+fi
+
+case "${1:-}" in
+  --install)
+    install_dependencies
+    exec "$VENV/bin/python" scripts/check_env.py
+    ;;
+  --check)
+    exec "$VENV/bin/python" scripts/check_env.py
+    ;;
+esac
+
+exec "$VENV/bin/python" run.py "$@"

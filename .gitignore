@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Configuration locale
+.env
+
+# Données locales : jamais versionnées.
+# Les répertoires restent dans Git (via .gitkeep), pas leur contenu.
+data/*
+!data/.gitkeep
+models/*
+!models/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Systèmes
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

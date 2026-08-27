@@ -1,0 +1,28 @@
+# Liliana — dépendances Python.
+# Chaque entrée est justifiée : voir docs/architecture.md, section "Dépendances".
+#
+#     pip install -r requirements.txt
+
+# --- Serveur web local ------------------------------------------------------
+fastapi>=0.115,<1.0          # API HTTP + validation des entrées
+uvicorn[standard]>=0.30,<1.0 # serveur ASGI qui sert l'API et l'interface
+python-multipart>=0.0.9      # réception de l'audio du navigateur (multipart/form-data)
+
+# --- Configuration ----------------------------------------------------------
+pydantic-settings>=2.4,<3.0  # lecture typée du .env (cf. app/core/config.py)
+
+# --- Client du LLM local ----------------------------------------------------
+httpx>=0.27,<1.0             # appels HTTP vers Ollama, avec streaming
+
+# --- Reconnaissance vocale locale -------------------------------------------
+# Embarque PyAV : décode directement le WebM/Opus du navigateur,
+# aucun ffmpeg système à installer.
+faster-whisper>=1.0.3,<2.0
+
+# --- Synthèse vocale locale -------------------------------------------------
+# Optionnel : Liliana fonctionne sans (elle répond alors en texte seul) et
+# accepte aussi l'exécutable `piper` du PATH. Décommentez pour la voie Python.
+# piper-tts>=1.2.0
+
+# --- Tests ------------------------------------------------------------------
+pytest>=8.0

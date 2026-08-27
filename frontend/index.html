@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Liliana — Language AI Tutor</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">L</span>
+      <div>
+        <h1>Liliana</h1>
+        <p>Language AI Tutor</p>
+      </div>
+    </div>
+
+    <div class="topbar-controls">
+      <label class="field">
+        <span>Language</span>
+        <select id="language-select"></select>
+      </label>
+      <label class="field">
+        <span>Mode</span>
+        <select id="mode-select"></select>
+      </label>
+      <label class="field">
+        <span>Correction</span>
+        <select id="correction-select">
+          <option value="off">Off</option>
+          <option value="minimal">Minimal</option>
+          <option value="normal" selected>Normal</option>
+          <option value="strict">Strict</option>
+        </select>
+      </label>
+      <button id="status-chip" class="status-chip" type="button" title="Engine status">
+        <span class="dot"></span><span id="status-text">Checking…</span>
+      </button>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="conversation" role="tab">Conversation</button>
+    <button class="tab" data-tab="exercises" role="tab">Exercises</button>
+    <button class="tab" data-tab="vocabulary" role="tab">Vocabulary</button>
+    <button class="tab" data-tab="progress" role="tab">Progress</button>
+  </nav>
+
+  <!-- ------------------------------------------------------ conversation -->
+  <section class="panel active" id="panel-conversation">
+    <div class="conversation" id="conversation">
+      <div class="empty-state" id="empty-state">
+        <h2>Say hello to Liliana</h2>
+        <p>Press <strong>Speak</strong> and talk. She listens, transcribes, answers out
+           loud, and quietly keeps track of your mistakes.</p>
+        <div class="quick-actions">
+          <button class="ghost" data-send="Hi Liliana, let's practice a little.">Start talking</button>
+          <button class="ghost" id="start-lesson">Start lesson</button>
+          <button class="ghost" id="run-assessment">Test my level</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="composer">
+      <div class="mic-row">
+        <button id="mic-button" class="mic" type="button" aria-label="Speak">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3z"/>
+            <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V21a1 1 0 1 0 2 0v-3.08A7 7 0 0 0 19 11z"/>
+          </svg>
+          <span id="mic-label">Speak</span>
+        </button>
+        <div class="mic-meta">
+          <div class="level-meter"><div id="level-bar"></div></div>
+          <p id="pipeline-status">Ready</p>
+        </div>
+        <label class="toggle" title="Stop recording automatically after a silence">
+          <input type="checkbox" id="hands-free" checked>
+          <span>Hands-free</span>
+        </label>
+        <label class="toggle" title="Play Liliana's answers out loud">
+          <input type="checkbox" id="voice-output" checked>
+          <span>Voice</span>
+        </label>
+      </div>
+      <form class="text-row" id="text-form">
+        <input id="text-input" type="text" autocomplete="off"
+               placeholder="…or type here and press Enter">
+        <button type="submit">Send</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- --------------------------------------------------------- exercises -->
+  <section class="panel" id="panel-exercises">
+    <div class="card-actions">
+      <button id="new-exercise" class="primary">New exercise</button>
+      <input id="exercise-topic" type="text" placeholder="Topic (optional): past simple, dative…">
+      <select id="exercise-type"><option value="">Any type</option></select>
+    </div>
+    <div id="exercise-area" class="card-list">
+      <p class="muted">Liliana picks a topic from the mistakes you actually make.</p>
+    </div>
+  </section>
+
+  <!-- -------------------------------------------------------- vocabulary -->
+  <section class="panel" id="panel-vocabulary">
+    <div class="card-actions">
+      <button id="load-vocabulary" class="primary">Review due words</button>
+      <input id="vocabulary-theme" type="text" placeholder="Learn new words about… (e.g. travel)">
+      <button id="teach-vocabulary">Teach me</button>
+    </div>
+    <div id="vocabulary-area" class="card-list">
+      <p class="muted">Words Liliana introduces during conversations land here automatically.</p>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------- progress -->
+  <section class="panel" id="panel-progress">
+    <div class="card-actions">
+      <button id="refresh-progress" class="primary">Refresh</button>
+    </div>
+    <div id="progress-area" class="dashboard"></div>
+  </section>
+
+</div>
+
+<!-- ------------------------------------------------------------- modals -->
+<div class="modal-backdrop" id="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <header>
+      <h2 id="modal-title">Liliana</h2>
+      <button id="modal-close" class="icon-button" aria-label="Close">×</button>
+    </header>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<audio id="player" hidden></audio>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

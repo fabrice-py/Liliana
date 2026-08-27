@@ -1,0 +1,220 @@
+"""Tests des commandes vocales, de la prononciation, des prompts et du placement."""
+
+from __future__ import annotations
+
+import pytest
+
+from app.ai.prompts import CONVERSATION_MODES, TutorContext, build_system_prompt, get_mode
+from app.language.assessment import get_items, score_objective
+from app.language.commands import detect_command
+from app.language.correction import filter_by_mode
+from app.language.languages import (
+    TARGET_LANGUAGES,
+    clamp_level,
+    error_types_for,
+    get_language,
+    is_supported,
+    level_index,
+    score_to_level,
+)
+from app.language.pronunciation import analyse
+
+
+# ------------------------------------------------------------------ langues
+def test_target_languages_are_english_and_german() -> None:
+    assert TARGET_LANGUAGES == ("english", "german")
+
+
+def test_german_has_its_own_error_types() -> None:
+    german = set(error_types_for("german"))
+    english = set(error_types_for("english"))
+    assert {"cases", "gender_der_die_das", "separable_verbs", "umlaut"} <= german
+    assert german > english
+
+
+def test_unknown_language_falls_back_to_english() -> None:
+    assert get_language("klingon").code == "english"
+    assert is_supported("klingon") is False
+
+
+@pytest.mark.parametrize(
+    ("score", "level"),
+    [(0, "A1"), (10, "A1"), (25, "A2"), (45, "B1"), (60, "B2"), (80, "C1"), (95, "C2")],
+)
+def test_score_maps_to_cefr_level(score: float, level: str) -> None:
+    assert score_to_level(score) == level
+
+
+def test_level_index_round_trip() -> None:
+    for level in ("A1", "A2", "B1", "B2", "C1", "C2"):
+        assert clamp_level(level_index(level)) == level
+
+
+def test_clamp_level_stays_within_bounds() -> None:
+    assert clamp_level(-5) == "A1"
+    assert clamp_level(99) == "C2"
+
+
+# --------------------------------------------------------- commandes vocales
+@pytest.mark.parametrize(
+    ("phrase", "action", "payload"),
+    [
+        ("Liliana, let's practice English.", "switch_language", {"language": "english"}),
+        ("Liliana, switch to German.", "switch_language", {"language": "german"}),
+        ("Passe à l'allemand", "switch_language", {"language": "german"}),
+        ("Liliana, correct me.", "set_correction_mode", {"correction_mode": "strict"}),
+        ("Liliana, stop correcting me", "set_correction_mode", {"correction_mode": "off"}),
+        ("Liliana, give me an exercise", "set_mode", {"mode": "grammar_training"}),
+        ("Liliana, let's just talk", "set_mode", {"mode": "just_talk"}),
+        ("immersion mode", "set_mode", {"mode": "immersion"}),
+        ("Liliana, speak more slowly", "speak_slower", {"speed": 0.75}),
+        ("Liliana, repeat that", "repeat", {}),
+        ("Liliana, translate this", "translate", {}),
+        ("start a lesson", "start_lesson", {}),
+    ],
+)
+def test_voice_commands_are_recognised(phrase: str, action: str, payload: dict) -> None:
+    command = detect_command(phrase)
+    assert command is not None
+    assert command.action == action
+    assert command.payload == payload
+
+
+def test_long_sentences_are_not_treated_as_commands() -> None:
+    sentence = (
+        "Yesterday I went to the cinema with my brother and we watched a very long film"
+    )
+    assert detect_command(sentence) is None
+
+
+def test_ordinary_speech_is_not_a_command() -> None:
+    assert detect_command("I like learning German because it is logical") is None
+    assert detect_command("") is None
+
+
+# ------------------------------------------------------------- prononciation
+def test_perfect_reading_scores_full_marks() -> None:
+    result = analyse("The weather is nice today", "the weather is nice today", "english")
+    assert result.score == 100.0
+    assert result.problem_sounds == []
+
+
+def test_th_substitution_is_detected() -> None:
+    result = analyse("I think this thing", "I sink dis sing", "english")
+    assert result.score < 70
+    assert "the English TH sound" in result.problem_sounds
+
+
+def test_missing_umlaut_is_detected() -> None:
+    result = analyse("Ich möchte ein Brötchen", "Ich mochte ein Brotchen", "german")
+    assert "the German Umlaut Ö" in result.problem_sounds
+
+
+def test_empty_transcription_is_handled() -> None:
+    result = analyse("Hello there", "", "english")
+    assert result.score == 0.0
+    assert "did not hear" in result.feedback
+
+
+def test_missing_target_sentence_is_handled() -> None:
+    assert analyse("", "hello", "english").score == 0.0
+
+
+def test_word_comparisons_cover_every_expected_word() -> None:
+    result = analyse("one two three", "one three", "english")
+    assert [word.expected for word in result.words if word.expected] == ["one", "two", "three"]
+    assert result.word_accuracy < 100
+
+
+# -------------------------------------------------------- modes de correction
+def test_correction_filter_respects_the_mode() -> None:
+    found = [
+        {"type": "grammar", "severity": "major"},
+        {"type": "register", "severity": "minor"},
+    ]
+    assert filter_by_mode(found, "off") == []
+    assert len(filter_by_mode(found, "minimal")) == 1
+    assert len(filter_by_mode(found, "normal")) == 2
+    assert len(filter_by_mode(found, "strict")) == 2
+
+
+def test_unknown_correction_mode_falls_back_to_normal() -> None:
+    found = [{"type": "grammar", "severity": "minor"}]
+    assert filter_by_mode(found, "aggressive") == found
+
+
+# --------------------------------------------------------------- prompts
+def test_every_mode_has_instructions() -> None:
+    for mode in CONVERSATION_MODES.values():
+        assert mode.instructions
+        assert mode.label
+        assert mode.default_correction_mode in ("off", "minimal", "normal", "strict")
+
+
+def test_unknown_mode_falls_back_to_free_conversation() -> None:
+    assert get_mode("nonsense").key == "free_conversation"
+
+
+def test_system_prompt_injects_the_learner_context() -> None:
+    context = TutorContext(
+        language="german",
+        level="B1",
+        mode="immersion",
+        correction_mode="strict",
+        weaknesses=[{"topic": "dative", "occurrences": 7}],
+        recent_errors=[{"original": "mit der Mann", "corrected": "mit dem Mann", "topic": "dative"}],
+        recent_vocabulary=["Bahnhof"],
+        review_items=["Umlaut"],
+    )
+    prompt = build_system_prompt(context)
+    assert "German" in prompt
+    assert "B1" in prompt
+    assert "dative (7 recent occurrences)" in prompt
+    assert "mit dem Mann" in prompt
+    assert "Bahnhof" in prompt
+    assert "STRICT" in prompt
+    # Le prompt doit annoncer les types d'erreurs propres à la langue.
+    assert "separable_verbs" in prompt
+
+
+def test_system_prompt_handles_a_blank_profile() -> None:
+    prompt = build_system_prompt(TutorContext())
+    assert "no weakness identified yet" in prompt
+    assert "no mistake recorded yet" in prompt
+
+
+# ------------------------------------------------------------- placement
+@pytest.mark.parametrize("language", ["english", "german"])
+def test_placement_bank_covers_every_level(language: str) -> None:
+    levels = {item.level for item in get_items(language)}
+    assert levels == {"A1", "A2", "B1", "B2", "C1"}
+
+
+@pytest.mark.parametrize("language", ["english", "german"])
+def test_placement_answers_are_among_the_options(language: str) -> None:
+    for item in get_items(language):
+        assert item.answer in item.options
+
+
+def test_placement_stops_at_the_first_failed_band() -> None:
+    items = get_items("english")
+    answers = {item.id: item.answer for item in items if item.level in ("A1", "A2")}
+    assert score_objective("english", answers).estimated_level == "A2"
+
+
+def test_placement_with_no_answers_returns_a1() -> None:
+    assert score_objective("english", {}).estimated_level == "A1"
+
+
+def test_a_perfect_placement_goes_one_band_above_the_bank() -> None:
+    items = get_items("german")
+    answers = {item.id: item.answer for item in items}
+    result = score_objective("german", answers)
+    assert result.estimated_level == "C2"
+    assert result.percent == 100.0
+
+
+def test_placement_answers_are_case_insensitive() -> None:
+    items = get_items("english")
+    answers = {item.id: item.answer.upper() for item in items if item.level == "A1"}
+    assert score_objective("english", answers).correct == 2
