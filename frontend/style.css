@@ -1,5 +1,14 @@
 /* Liliana — interface locale. Sombre par défaut, claire si le système l'est. */
 
+/* L'attribut `hidden` doit toujours l'emporter.
+   Le navigateur ne lui applique qu'un `[hidden] { display: none }` de très faible
+   priorité : n'importe quelle règle de classe fixant `display` le neutralise, et
+   l'élément reste affiché malgré l'attribut. C'est ce qui laissait la fenêtre
+   modale ouverte en permanence — `.modal-backdrop` déclare `display: grid`, si
+   bien que la masquer depuis le JavaScript n'avait aucun effet et que sa croix
+   de fermeture semblait morte. */
+[hidden] { display: none !important; }
+
 :root {
   --bg: #0e0f16;
   --bg-soft: #161824;
