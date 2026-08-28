@@ -312,3 +312,121 @@ def test_practice_sentence_rotates() -> None:
     first = pick_sentence("english", category="TH", rotation=0)[1]
     second = pick_sentence("english", category="TH", rotation=1)[1]
     assert first != second
+
+
+# ------------------------------------------------------------- mot d'eveil
+from app.language import wake_word  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("phrase", "reste"),
+    [
+        ("Liliana, how are you today?", "how are you today"),
+        ("Hello Liliana, I want to practise English.", "I want to practise English"),
+        ("Hey Liliana what is a phrasal verb", "what is a phrasal verb"),
+        ("Bonjour Liliana, on parle allemand ?", "on parle allemand"),
+    ],
+)
+def test_the_call_is_recognised_and_stripped(phrase: str, reste: str) -> None:
+    """Le nom sert a appeler ; ce qui suit est la vraie prise de parole."""
+    heard = wake_word.detect(phrase)
+    assert heard.heard
+    assert heard.remainder == reste
+
+
+@pytest.mark.parametrize("phrase", ["Lilliana can you help me", "Liliane, comment vas-tu ?",
+                                    "Lily Anna are you there", "Lilyana I need help"])
+def test_whisper_mishearings_still_wake_her(phrase: str) -> None:
+    """Whisper n'ecrit presque jamais le nom deux fois de la meme facon.
+
+    Une egalite stricte rendrait l'eveil inutilisable sur une voix accentuee.
+    """
+    assert wake_word.detect(phrase).heard
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Yesterday I go to the cinema.",
+        "What is the weather like today?",
+        "I told my friend Liliana that the film was good.",
+        "",
+        "   ",
+    ],
+)
+def test_speech_that_is_not_addressed_to_her_is_ignored(phrase: str) -> None:
+    """Le nom prononce au milieu d'un recit ne doit pas declencher un tour."""
+    assert wake_word.detect(phrase).heard is False
+
+
+def test_the_name_alone_is_a_valid_call() -> None:
+    """« Liliana ? » appelle sans rien demander : l'appelant attend une invite."""
+    heard = wake_word.detect("Liliana?")
+    assert heard.heard
+    assert heard.remainder == ""
+
+
+def test_a_stricter_threshold_rejects_approximations() -> None:
+    assert wake_word.detect("Liliane hello", threshold=0.99).heard is False
+    assert wake_word.detect("Liliana hello", threshold=0.99).heard is True
+
+
+def test_several_names_can_be_configured() -> None:
+    assert wake_word.parse_wake_words("Liliana, Lili") == ("Liliana", "Lili")
+    assert wake_word.parse_wake_words("") == ("Liliana",)
+    assert wake_word.detect("Lili, what does this mean?", ("Liliana", "Lili")).heard
+
+
+def test_the_reply_prompt_knows_what_the_learner_must_practise() -> None:
+    """Une reponse qui ignore les faiblesses de l'apprenant n'enseigne rien.
+
+    C'est ce qui distingue une professeure d'un agent conversationnel : elle
+    oriente la conversation vers ce qui coince.
+    """
+    from app.ai.prompts import build_reply_prompt
+
+    prompt = build_reply_prompt(
+        TutorContext(
+            language="english",
+            mode="english_teacher",
+            level="B1",
+            weaknesses=[{"topic": "past_simple", "occurrences": 12}],
+            review_items=["irregular verbs"],
+        )
+    )
+    assert "past_simple" in prompt
+    assert "irregular verbs" in prompt
+    assert "B1" in prompt
+
+
+def test_the_reply_prompt_leaves_out_what_changes_every_single_turn() -> None:
+    """Le detail litteral des dernieres erreurs appartient a l'analyse.
+
+    Il n'ameliore pas la reponse parlee, et il suffisait a changer le prompt a
+    chaque phrase — donc a interdire a Ollama de le relire dans son cache.
+    Les points faibles, eux, evoluent en jours : ils restent.
+    """
+    from app.ai.prompts import build_reply_prompt
+
+    def prompt_with(**extra):
+        return build_reply_prompt(
+            TutorContext(
+                language="english", mode="english_teacher", level="B1",
+                weaknesses=[{"topic": "past_simple", "occurrences": 12}], **extra,
+            )
+        )
+
+    stable = prompt_with()
+    assert prompt_with(recent_errors=[{"original": "I go", "corrected": "I went"}]) == stable
+    assert prompt_with(recent_vocabulary=["commute", "sleeve"]) == stable
+    # Le compteur d'occurrences change a chaque tour : lui non plus n'y figure pas.
+    assert "12" not in stable
+
+
+def test_the_analysis_prompt_does_depend_on_the_learner() -> None:
+    """Corriger, en revanche, demande de savoir a qui on parle."""
+    from app.ai.prompts import build_analysis_prompt
+
+    a = build_analysis_prompt(TutorContext(language="english", level="A1"))
+    b = build_analysis_prompt(TutorContext(language="english", level="C1"))
+    assert a != b

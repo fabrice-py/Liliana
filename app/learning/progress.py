@@ -197,13 +197,19 @@ class ProgressTracker:
         seconds: int = 0,
         errors_found: int = 0,
         words_learned: int = 0,
+        counts_as_a_turn: bool = True,
     ) -> None:
-        """Comptabilise un tour de conversation dans les statistiques du jour."""
+        """Comptabilise un tour de conversation dans les statistiques du jour.
+
+        ``counts_as_a_turn`` vaut False pour l'analyse pédagogique, qui suit la
+        réponse quelques secondes plus tard : c'est le même échange, il ne doit
+        être compté qu'une fois. Ce qu'elle a trouvé, en revanche, s'ajoute.
+        """
         progress_repo.add(
             user_id,
             language,
             seconds=seconds,
-            messages=1,
+            messages=1 if counts_as_a_turn else 0,
             errors=errors_found,
             words=words_learned,
         )

@@ -30,7 +30,7 @@ from app.database.repositories import (
     users as user_repo,
     vocabulary as vocabulary_repo,
 )
-from app.language import phonemes, pronunciation as pronunciation_module
+from app.language import phonemes, pronunciation as pronunciation_module, wake_word
 from app.language.assessment import assessment_service, build_test
 from app.language.commands import detect_command
 from app.language.correction import correction_service
@@ -163,7 +163,7 @@ def _stream_turn(
     started = time.perf_counter()
     spoken_chunks = 0
 
-    for event in tutor.respond_stream(
+    for event in tutor.reply_stream(
         user_id=user_id,
         session_id=int(session["id"]),
         text=text,
@@ -187,7 +187,50 @@ def _stream_turn(
             payload["mode"] = mode
             payload["llm_elapsed"] = round(time.perf_counter() - started, 2)
             payload["spoken_chunks"] = spoken_chunks
+            # Le flux se referme ici, dès que la réponse est dite. L'analyse
+            # pédagogique de `analyse_text` est demandée séparément par
+            # l'interface : la faire attendre ici rendrait la parole à
+            # l'utilisateur quarante secondes trop tard.
+            payload["analyse_text"] = text
+            payload["session_id"] = int(session["id"])
             yield _sse("done", payload)
+
+
+def _acknowledgement(language: str, speak: bool, speed: float) -> dict[str, Any]:
+    """Réponse à un appel sans question (« Liliana ? »).
+
+    Rien à corriger, rien à enregistrer : ce n'est pas une prise de parole en
+    langue étrangère, juste un appel. La réponse reste dans la langue travaillée
+    pour ne pas casser l'immersion.
+    """
+    invitations = {
+        "english": "Yes? I'm listening.",
+        "german": "Ja? Ich höre zu.",
+        "french": "Oui ? Je t'écoute.",
+    }
+    text = invitations.get(language, invitations["english"])
+    payload: dict[str, Any] = {
+        "response": text,
+        "correction": None,
+        "errors": [],
+        "vocabulary": [],
+        "detected_language": language,
+        "difficulty": "",
+        "session_id": None,
+        "structured": True,
+        "level": "",
+        "command": None,
+        "language": language,
+        "mode": None,
+        "llm_elapsed": 0.0,
+        "spoken_chunks": 0,
+        "acknowledgement": True,
+    }
+    if speak:
+        speech = _speak(text, language, speed)
+        if speech is not None:
+            payload["speech"] = speech
+    return payload
 
 
 def _apply_command(
@@ -334,6 +377,10 @@ def configuration() -> dict[str, Any]:
         "correction_modes": ["off", "minimal", "normal", "strict"],
         "exercise_types": list(EXERCISE_TYPES),
         "vad": get_vad_settings().as_dict(),
+        "wake_word": {
+            "words": list(wake_word.parse_wake_words(settings.wake_word)),
+            "follow_up_seconds": settings.wake_follow_up_seconds,
+        },
         "current": {
             "language": _resolve_language(None),
             "mode": _resolve_mode(None),
@@ -537,11 +584,17 @@ async def voice_turn_stream(
     correction_mode: str | None = Form(default=None),
     speak: bool = Form(default=True),
     speed: float = Form(default=1.0),
+    require_wake_word: bool = Form(default=False),
 ) -> StreamingResponse:
     """Tour vocal diffusé de bout en bout.
 
     L'utilisateur voit sa transcription se former, puis la réponse s'écrire, et
     entend la première phrase pendant que la suite est encore en génération.
+
+    ``require_wake_word`` est posé par l'écoute permanente : le micro capte alors
+    tout ce qui se dit, et seule une phrase adressée à Liliana doit lui coûter un
+    appel au modèle de langue. La transcription, elle, a déjà eu lieu — c'est le
+    prix de l'écoute, et il reste modeste.
     """
     data = await audio.read()
     try:
@@ -569,9 +622,33 @@ async def voice_turn_stream(
                 raise EmptyTranscriptionError("no speech detected")
             yield _sse("transcription", {**transcription.as_dict(), "partial": False})
 
+            spoken_text = transcription.text
+            if require_wake_word:
+                settings = get_settings()
+                heard = wake_word.detect(
+                    spoken_text,
+                    wake_word.parse_wake_words(settings.wake_word),
+                    threshold=settings.wake_word_similarity,
+                )
+                if not heard.heard:
+                    # Quelqu'un a parlé, mais pas à elle. On le signale à
+                    # l'interface pour qu'elle reste lisible, et on s'arrête là :
+                    # aucun appel au modèle, aucune trace en base.
+                    yield _sse("ignored", {"text": spoken_text, "reason": "no wake word"})
+                    return
+                yield _sse(
+                    "awake",
+                    {"matched": heard.matched, "score": heard.score, "text": heard.remainder},
+                )
+                spoken_text = heard.remainder
+                if not spoken_text:
+                    # « Liliana ? » tout court : un appel, pas une prise de parole.
+                    yield _sse("done", _acknowledgement(resolved_language, speak, resolved_speed))
+                    return
+
             yield from _stream_turn(
                 user_id=user_id,
-                text=transcription.text,
+                text=spoken_text,
                 language=resolved_language,
                 mode=resolved_mode,
                 correction_mode=correction_mode,
@@ -596,6 +673,36 @@ def speak(payload: SpeakRequest) -> dict[str, Any]:
         available, detail = get_tts_provider().is_available()
         raise HTTPException(503, detail={"message": detail})
     return speech
+
+
+class AnalysisRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+    session_id: int
+    language: str | None = None
+    correction_mode: CorrectionModeName | None = None
+    is_voice: bool = False
+
+
+@router.post("/analyse")
+def analyse_turn(payload: AnalysisRequest) -> dict[str, Any]:
+    """Analyse pédagogique d'un tour déjà répondu.
+
+    Second temps du tour : la conversation a eu lieu, la correction arrive
+    ensuite. Séparer les deux fait tomber le délai avant d'entendre Liliana de
+    cinquante secondes à trois — l'essentiel du coût était l'analyse, que
+    personne n'a besoin d'attendre pour parler.
+    """
+    try:
+        return tutor.analyse(
+            user_id=_current_user_id(),
+            session_id=payload.session_id,
+            text=payload.text,
+            language=_resolve_language(payload.language),
+            correction_mode=payload.correction_mode,
+            is_voice=payload.is_voice,
+        )
+    except LilianaError as exc:
+        raise _fail(exc) from exc
 
 
 # -------------------------------------------------------------- correction

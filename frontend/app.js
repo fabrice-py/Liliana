@@ -208,6 +208,9 @@ function base64ToBlobUrl(audioBase64, mimeType) {
 const audioQueue = {
   urls: [],
   playing: false,
+  //: Appelé une fois la dernière phrase prononcée. Sert au mains libres :
+  //: reprendre le micro pendant qu'elle parle lui ferait entendre sa propre voix.
+  onIdle: null,
 
   push(audioBase64, mimeType) {
     this.urls.push(base64ToBlobUrl(audioBase64, mimeType));
@@ -216,7 +219,11 @@ const audioQueue = {
 
   playNext() {
     const url = this.urls.shift();
-    if (!url) { this.playing = false; return; }
+    if (!url) {
+      this.playing = false;
+      if (this.onIdle) { const done = this.onIdle; this.onIdle = null; done(); }
+      return;
+    }
     this.playing = true;
     const player = $('player');
     player.src = url;
@@ -383,10 +390,236 @@ function stopVad() {
   }
 }
 
+/* ------------------------------------------------- ecoute permanente */
+
+/* Liliana écoute en continu et ne répond que si on l'appelle par son nom.
+ *
+ * Le micro reste ouvert, mais rien n'est envoyé tant qu'une phrase complète
+ * n'a pas été prononcée. L'enregistreur tourne sans interruption plutôt que de
+ * démarrer à la détection de parole : démarré trop tard, il mangerait la
+ * première syllabe — c'est-à-dire le nom lui-même. Le silence qui précède est
+ * sans conséquence, le filtre de Whisper le retire.
+ *
+ * Chaque phrase est transcrite localement ; seule celle qui contient le nom
+ * coûte un appel au modèle de langue. Après une réponse, une courte fenêtre
+ * permet d'enchaîner sans répéter le nom.
+ */
+const listener = {
+  active: false,
+  recorder: null,
+  chunks: [],
+  raf: 0,
+  analyser: null,
+  audioContext: null,
+  awakeUntil: 0,
+  startedAt: 0,
+  lastSpeechAt: 0,
+  speechDuration: 0,
+  previousSample: 0,
+
+  /** Vrai tant qu'on peut enchaîner sans redire le nom. */
+  isAwake() {
+    return performance.now() < this.awakeUntil;
+  },
+
+  keepAwake() {
+    const seconds = state.config?.wake_word?.follow_up_seconds ?? 30;
+    this.awakeUntil = performance.now() + seconds * 1000;
+  },
+
+  sleep() {
+    this.awakeUntil = 0;
+  },
+
+  async start() {
+    if (this.active) return;
+    try {
+      await ensureMicrophone();
+    } catch (error) {
+      toast(error.message);
+      $('always-listening').checked = false;
+      return;
+    }
+    this.active = true;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    this.audioContext = new AudioCtx();
+    const source = this.audioContext.createMediaStreamSource(media.stream);
+    this.analyser = this.audioContext.createAnalyser();
+    this.analyser.fftSize = 1024;
+    source.connect(this.analyser);
+    this.beginSegment();
+    this.tick();
+    this.announce();
+  },
+
+  stop() {
+    this.active = false;
+    this.sleep();
+    cancelAnimationFrame(this.raf);
+    try {
+      if (this.recorder && this.recorder.state !== 'inactive') {
+        this.recorder.onstop = null;
+        this.recorder.stop();
+      }
+    } catch { /* déjà arrêté */ }
+    this.recorder = null;
+    this.chunks = [];
+    if (this.audioContext) {
+      this.audioContext.close().catch(() => {});
+      this.audioContext = null;
+    }
+    const meter = $('level-bar');
+    if (meter) meter.style.width = '0%';
+    if (!state.busy) setStatus('Ready');
+  },
+
+  announce() {
+    if (!this.active || state.busy) return;
+    if (!$('always-listening').checked || this.isAwake()) {
+      setStatus('Listening — just talk');
+      return;
+    }
+    const names = state.config?.wake_word?.words ?? ['Liliana'];
+    setStatus(`Listening for "${names[0]}"…`);
+  },
+
+  /** Ouvre un nouvel enregistrement. */
+  beginSegment() {
+    if (!this.active) return;
+    this.chunks = [];
+    const mimeType = pickMimeType();
+    try {
+      this.recorder = new MediaRecorder(media.stream, mimeType ? { mimeType } : undefined);
+    } catch (error) {
+      toast(`Cannot listen: ${error.message}`);
+      this.stop();
+      $('always-listening').checked = false;
+      return;
+    }
+    this.recorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) this.chunks.push(event.data);
+    };
+    this.recorder.onstop = () => this.segmentReady();
+    this.recorder.start();
+
+    this.startedAt = performance.now();
+    this.previousSample = this.startedAt;
+    this.lastSpeechAt = 0;
+    this.speechDuration = 0;
+  },
+
+  /** Ferme le segment courant et en rouvre un aussitôt. */
+  closeSegment() {
+    try {
+      if (this.recorder && this.recorder.state !== 'inactive') this.recorder.stop();
+    } catch { /* déjà arrêté */ }
+  },
+
+  async segmentReady() {
+    const blob = new Blob(this.chunks, { type: (this.recorder && this.recorder.mimeType) || 'audio/webm' });
+    this.chunks = [];
+    const spoke = this.speechDuration >= state.vad.min_speech_duration;
+
+    if (!this.active) return;
+    if (!spoke || blob.size < 1200) {
+      this.beginSegment();          // rien d'audible : on repart sans rien envoyer
+      return;
+    }
+
+    await this.sendUtterance(blob);
+    if (this.active) { this.beginSegment(); this.announce(); }
+  },
+
+  async sendUtterance(blob) {
+    if (state.busy) return;
+    const form = new FormData();
+    form.append('audio', blob, 'turn.webm');
+    form.append('language', state.language);
+    form.append('mode', state.mode);
+    form.append('correction_mode', state.correctionMode);
+    form.append('speak', String($('voice-output').checked));
+    form.append('speed', String(state.speed));
+    // Le nom n'est exigé que si on l'a demandé, et seulement tant qu'elle dort.
+    const byName = $('always-listening').checked;
+    form.append('require_wake_word', String(byName && !this.isAwake()));
+
+    setBusy(true, 'Transcribing…');
+    const placeholder = addBubble('You', '…');
+    try {
+      const payload = await runStreamingTurn({
+        path: '/voice/turn/stream', body: form, userBubble: placeholder,
+      });
+      if (payload.ignored) {
+        placeholder.remove();       // ce n'était pas pour elle
+      } else {
+        this.keepAwake();
+      }
+    } catch (error) {
+      placeholder.remove();
+      // Une phrase mal captée ne doit pas arrêter l'écoute : on la passe.
+      if (!/did not hear|too short/i.test(error.message || '')) {
+        toast(error.message);
+      }
+    } finally {
+      setBusy(false);
+      this.announce();
+    }
+  },
+
+  /** Boucle d'analyse : repère la fin d'une prise de parole. */
+  tick() {
+    if (!this.active) return;
+    this.raf = requestAnimationFrame(() => this.tick());
+    if (!this.analyser) return;
+
+    // Pendant qu'elle parle ou réfléchit, on n'écoute pas : sa propre voix
+    // relancerait un tour, et l'annulation d'écho ne suffit pas toujours.
+    if (state.busy || audioQueue.playing) {
+      this.previousSample = performance.now();
+      this.lastSpeechAt = 0;
+      this.speechDuration = 0;
+      return;
+    }
+
+    const buffer = new Uint8Array(this.analyser.fftSize);
+    this.analyser.getByteTimeDomainData(buffer);
+    let sum = 0;
+    for (const sample of buffer) {
+      const centred = (sample - 128) / 128;
+      sum += centred * centred;
+    }
+    const rms = Math.sqrt(sum / buffer.length);
+    const meter = $('level-bar');
+    if (meter) meter.style.width = `${Math.min(100, rms * 450)}%`;
+
+    const now = performance.now();
+    if (rms >= state.vad.energy_threshold) {
+      this.speechDuration += (now - this.previousSample) / 1000;
+      this.lastSpeechAt = now;
+    }
+    this.previousSample = now;
+
+    const spoke = this.speechDuration >= state.vad.min_speech_duration;
+    const silentFor = this.lastSpeechAt ? (now - this.lastSpeechAt) / 1000 : 0;
+
+    if (spoke && silentFor >= state.vad.silence_threshold) {
+      this.closeSegment();
+      return;
+    }
+    // Sans parole, on recycle le segment : inutile de garder des minutes de silence.
+    if (!spoke && now - this.startedAt > 15000) { this.closeSegment(); return; }
+    // Garde-fou : personne ne parle 60 s d'affilée sans respirer.
+    if (now - this.startedAt > 60000) this.closeSegment();
+  },
+};
+
 /* ------------------------------------------------------------ tour vocal */
 
 async function startRecording(handler = sendVoiceTurn, levelBarId = 'level-bar') {
   if (state.recording || state.busy) return;
+  // Un appui sur « Speak » prend la main le temps d'un tour : deux
+  // enregistreurs ne peuvent pas se partager le même flux micro.
+  if (listener.active) listener.stop();
   media.onBlob = handler;
   media.levelBarId = levelBarId;
   try {
@@ -440,6 +673,20 @@ function stopRecording() {
     if (media.recorder && media.recorder.state !== 'inactive') media.recorder.stop();
   } catch { /* déjà arrêté */ }
   stopVad();
+}
+
+/* Met le micro en écoute continue, ou l'en retire.
+ *
+ * « Mains libres » ne veut pas dire « couper l'enregistrement toute seule » —
+ * il voulait dire ça, et il fallait donc recliquer sur « Speak » à chaque
+ * phrase. Il veut dire : ne plus jamais toucher au bouton. La case pilote donc
+ * l'écoute permanente, qui se remet d'elle-même après chaque réponse.
+ */
+function applyHandsFree() {
+  const wanted = $('hands-free').checked
+    && document.querySelector('#panel-conversation.active') !== null;
+  if (wanted && !listener.active) listener.start();
+  else if (!wanted && listener.active) listener.stop();
 }
 
 function setBusy(busy, label) {
@@ -512,6 +759,16 @@ async function runStreamingTurn({ path, body, headers, userBubble }) {
         applyCommandFeedback(data);
         break;
 
+      // Quelqu'un a parlé, mais sans appeler Liliana : elle se tait.
+      case 'ignored':
+        return { ignored: true, text: data.text };
+
+      // Son nom a été reconnu : la phrase qui suit lui est adressée.
+      case 'awake':
+        if (userBubble) bubbleBody(userBubble).textContent = data.text || '…';
+        setStatus('Thinking…');
+        break;
+
       case 'delta':
         if (!answerBubble) {
           answerBubble = addBubble('Liliana', '');
@@ -558,6 +815,33 @@ function finishStreamedTurn(answerBubble, streamedText, payload) {
     toast(`New vocabulary saved: ${payload.vocabulary.map((e) => e.word).join(', ')}`, false);
   }
   scrollDown();
+
+  // La correction demande dix fois plus de tokens que la phrase parlée : on ne
+  // la fait pas attendre à l'utilisateur. Elle est demandée maintenant, en
+  // arrière-plan, et vient se placer sous la réponse dès qu'elle arrive.
+  requestAnalysis(payload);
+}
+
+/* Second temps du tour : la correction, une fois la réponse déjà entendue. */
+async function requestAnalysis(payload) {
+  if (!payload.analyse_text || !payload.session_id) return;
+  try {
+    const analysis = await postJSON('/analyse', {
+      text: payload.analyse_text,
+      session_id: payload.session_id,
+      language: payload.language || state.language,
+      correction_mode: state.correctionMode,
+    });
+    addCorrection(analysis.correction, analysis.errors);
+    if (analysis.vocabulary && analysis.vocabulary.length) {
+      const words = analysis.vocabulary.map((entry) => entry.word).join(', ');
+      toast(`New vocabulary saved: ${words}`, false);
+    }
+    scrollDown();
+  } catch {
+    // L'analyse est un bonus : son échec ne doit rien casser dans la
+    // conversation, qui a déjà eu lieu.
+  }
 }
 
 async function sendVoiceTurn(blob) {
@@ -592,6 +876,7 @@ async function sendVoiceTurn(blob) {
     }
   } finally {
     setBusy(false);
+    applyHandsFree();
   }
 }
 
@@ -1335,6 +1620,8 @@ function switchTab(name) {
   if (name === 'progress') loadProgress();
   if (name === 'vocabulary') loadVocabulary();
   if (name === 'pronunciation' && !pronunciation.sentence) loadPronunciationSentence();
+  // L'écoute n'a de sens que dans la conversation : ailleurs, on rend le micro.
+  applyHandsFree();
 }
 
 async function persistSettings() {
@@ -1392,6 +1679,18 @@ async function boot() {
 
   $('correction-select').value = state.correctionMode;
 
+  // Le mains libres démarre tout seul, mais pas avant que la page ait été
+  // touchée : les navigateurs refusent le micro et le son tant que
+  // l'utilisateur n'a pas interagi, et une demande d'autorisation qui surgit
+  // au chargement se fait refuser d'un réflexe.
+  const startListeningOnFirstGesture = () => {
+    document.removeEventListener('pointerdown', startListeningOnFirstGesture);
+    document.removeEventListener('keydown', startListeningOnFirstGesture);
+    applyHandsFree();
+  };
+  document.addEventListener('pointerdown', startListeningOnFirstGesture, { once: true });
+  document.addEventListener('keydown', startListeningOnFirstGesture, { once: true });
+
   languageSelect.addEventListener('change', async () => {
     state.language = languageSelect.value;
     await persistSettings();
@@ -1447,6 +1746,9 @@ async function boot() {
   $('hear-sentence').addEventListener('click', () => speakText(pronunciation.sentence));
   $('record-pronunciation').addEventListener('click', togglePronunciationRecording);
   $('status-chip').addEventListener('click', showHealthDetails);
+  $('hands-free').addEventListener('change', applyHandsFree);
+  $('always-listening').addEventListener('change', () => listener.announce());
+
   $('modal-close').addEventListener('click', closeModal);
   $('modal-backdrop').addEventListener('click', (event) => {
     if (event.target === $('modal-backdrop')) closeModal();

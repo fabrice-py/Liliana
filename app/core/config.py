@@ -87,6 +87,17 @@ class Settings(BaseSettings):
     vad_energy_threshold: float = 0.015  # RMS normalisé au-dessus duquel on parle
     vad_min_speech_duration: float = 0.3 # ignore les bruits très courts
 
+    # ------------------------------------------------------------ mot d'éveil
+    #: Nom qui réveille Liliana en écoute permanente. Plusieurs noms possibles,
+    #: séparés par des virgules.
+    wake_word: str = "Liliana"
+    #: Ressemblance minimale acceptée. Whisper écrit rarement le nom deux fois
+    #: de la même façon : trop haut, l'éveil ne répond jamais ; trop bas, elle
+    #: se réveille sur n'importe quoi. 0.8 laisse passer « Lilliana », « Liliane ».
+    wake_word_similarity: float = 0.8
+    #: Après une réponse, on peut enchaîner sans redire le nom pendant ce délai.
+    wake_follow_up_seconds: int = 30
+
     # ------------------------------------------------------------- stockage
     database_path: Path = Path("data/liliana.db")
     models_dir: Path = Path("models")

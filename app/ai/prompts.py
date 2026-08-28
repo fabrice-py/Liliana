@@ -388,6 +388,159 @@ TURN_RESPONSE_SCHEMA: dict[str, Any] = _object(
 )
 
 
+# ------------------------------------------------- tour en deux temps
+#
+# Un tour coûtait autrefois un seul appel produisant tout à la fois : la phrase
+# parlée, la correction, les erreurs, le vocabulaire, le niveau. Mesuré sur une
+# machine sans GPU, cet appel demandait 180 tokens et 52 secondes — alors que la
+# phrase réellement prononcée en pesait 14, soit 3 secondes.
+#
+# L'analyse pédagogique est donc séparée de la conversation. Liliana répond
+# d'abord, puis la correction arrive quelques secondes plus tard sous sa
+# réponse. Rien n'est perdu : la correction est enregistrée dans tous les cas.
+
+REPLY_INSTRUCTIONS = """React to WHAT THE LEARNER SAID — the content, not the grammar. Show interest,
+add something of your own, then ask them a question that makes them speak again.
+
+Never simply repeat their sentence back to them, corrected or otherwise. That
+teaches nothing and ends the conversation. Their mistakes are handled elsewhere
+and shown to them separately; your job here is to keep them talking.
+
+    They say:  "Yesterday I go to the cinema with my friend."
+    Bad:       "Yesterday I went to the cinema with my friend."
+    Good:      "Oh nice! What did you watch? Was it any good?"
+
+Steer towards what they need to practise: choose questions that make them
+produce those forms again, without ever announcing that you are doing so.
+
+One or two short sentences. Plain text — no JSON, no markdown, no quotation
+marks around your answer, no meta-commentary. It will be read aloud."""
+
+
+def build_reply_prompt(context: TutorContext) -> str:
+    """Prompt du premier temps : la phrase que Liliana prononce.
+
+    Elle garde ici ce qui fait d'elle un professeur — le niveau de l'apprenant
+    et les points qu'il doit travailler — parce que c'est précisément ce qui doit
+    orienter la conversation. Une réponse qui ignore les faiblesses de
+    l'apprenant n'enseigne rien.
+
+    Ce qu'elle laisse à l'analyse, en revanche, c'est le détail qui change à
+    chaque phrase : la liste littérale des dernières erreurs et des derniers mots
+    introduits. Cela ne rend pas la réponse meilleure, et cela suffisait à
+    changer le prompt à chaque tour — donc à interdire à Ollama de le relire
+    dans son cache. Les points faibles, eux, évoluent en jours, pas en phrases :
+    ils restent, débarrassés de leurs compteurs.
+    """
+    language = get_language(context.language)
+    mode = get_mode(context.mode)
+
+    topics = [
+        str(item.get("topic") or item.get("error_type") or "").strip()
+        for item in context.weaknesses
+    ]
+    topics = [topic for topic in topics if topic][:5]
+
+    sections = [
+        BASE_SYSTEM_PROMPT,
+        "",
+        "## Current context",
+        f"Target language: {language.english_name} ({language.native_name})",
+        f"User's native language: {context.native_language}",
+        f"Session mode: {mode.label}",
+        "",
+        "## Mode instructions",
+        mode.instructions,
+        "",
+        "## " + correction_instruction(context.correction_mode).split(".")[0],
+        correction_instruction(context.correction_mode),
+        "",
+        "## How to answer",
+        REPLY_INSTRUCTIONS,
+        "",
+        "## This learner",
+        f"CEFR level: {context.level}",
+        "",
+        "## What they need to practise (steer the conversation towards these)",
+        _bullet_list(topics, "nothing identified yet — find out what they can do"),
+    ]
+    if context.review_items:
+        sections += [
+            "",
+            "## Due for review (bring these back into the conversation)",
+            _bullet_list(context.review_items[:8]),
+        ]
+    return "\n".join(sections)
+
+
+ANALYSIS_INSTRUCTIONS = """You are analysing ONE sentence a learner produced. You are not conversing.
+
+Report only genuine mistakes. If the sentence is correct, leave `correction`
+empty and `errors` empty — do not invent problems to look useful.
+
+`corrected` must keep the learner's meaning and their point of view: if they
+said "I", the correction says "I", never "you".
+
+`vocabulary` lists only words worth teaching them, drawn from your correction.
+Leave it empty when there is nothing new."""
+
+
+def build_analysis_prompt(context: TutorContext) -> str:
+    """Prompt du second temps : l'analyse pédagogique, en arrière-plan.
+
+    Il ne reprend ni la personnalité, ni le mode de conversation, ni l'historique
+    — rien de tout cela ne sert à corriger une phrase. Le prompt tombe ainsi de
+    ~900 à ~250 tokens, et ce qu'il produit n'est plus attendu par personne.
+    """
+    language = get_language(context.language)
+    return "\n".join(
+        [
+            f"You are a {language.english_name} teacher correcting one sentence.",
+            "",
+            f"Learner's CEFR level: {context.level}",
+            f"Learner's native language: {context.native_language}",
+            "",
+            "## " + correction_instruction(context.correction_mode).split(".")[0],
+            correction_instruction(context.correction_mode),
+            "",
+            "## Error types you may use",
+            ", ".join(language.error_types),
+            "",
+            "## How to analyse",
+            ANALYSIS_INSTRUCTIONS,
+        ]
+    )
+
+
+#: Contrat de l'analyse. Même logique que TURN_RESPONSE_SCHEMA : les champs sont
+#: obligatoires, sans quoi un petit modèle les oublie. `response` en est absent —
+#: la conversation a déjà eu lieu.
+ANALYSIS_SCHEMA: dict[str, Any] = _object(
+    correction=_object(original=_STRING, corrected=_STRING, explanation=_STRING),
+    errors={
+        "type": "array",
+        "items": _object(
+            type=_STRING,
+            topic=_STRING,
+            original=_STRING,
+            corrected=_STRING,
+            severity={"type": "string", "enum": ["minor", "major"]},
+        ),
+    },
+    vocabulary={
+        "type": "array",
+        "items": _object(
+            word=_STRING, translation=_STRING, example=_STRING, difficulty=_LEVEL
+        ),
+    },
+    detected_language={
+        "type": "string",
+        "enum": ["english", "german", "french", "other"],
+    },
+    difficulty=_LEVEL,
+)
+
+
 def build_turn_prompt(context: TutorContext) -> str:
     """Prompt système + contrat de sortie JSON."""
     return build_system_prompt(context, output_format=RESPONSE_SCHEMA_PROMPT)

@@ -242,15 +242,78 @@ def test_chat_stream_event_sequence(client) -> None:
 
 
 def test_chat_stream_deltas_match_the_final_answer(client) -> None:
-    client.fake_llm.responses = [TURN_JSON]
+    client.fake_llm.responses = ["That sounds fun. What did you watch?"]
     events = parse_sse(
         client.post("/api/chat/turn/stream", json={"text": "Hello"}).text
     )
     deltas = "".join(data["text"] for name, data in events if name == "delta")
     done = next(data for name, data in events if name == "done")
     assert deltas == done["response"]
-    assert done["correction"]["corrected"] == "Yesterday I went to the cinema"
-    assert done["errors"][0]["topic"] == "past_simple"
+
+
+def test_the_stream_carries_the_answer_only_and_says_what_is_left_to_analyse(client) -> None:
+    """Le flux se referme dès que la phrase est dite, sans attendre la correction.
+
+    C'est tout l'objet du découpage : l'analyse pédagogique pesait dix fois plus
+    de tokens que la réponse parlée, et la faire attendre ici rendait la parole à
+    l'utilisateur des dizaines de secondes trop tard.
+    """
+    client.fake_llm.responses = ["That sounds fun. What did you watch?"]
+    events = parse_sse(
+        client.post("/api/chat/turn/stream", json={"text": "Yesterday I go there"}).text
+    )
+    done = next(data for name, data in events if name == "done")
+
+    assert done["response"]
+    assert done["correction"] is None          # elle viendra de /api/analyse
+    assert done["errors"] == []
+    # L'interface doit savoir quoi faire analyser, et dans quelle session.
+    assert done["analyse_text"] == "Yesterday I go there"
+    assert done["session_id"]
+
+
+def test_the_analysis_endpoint_returns_the_correction(client) -> None:
+    """Second temps : ce que la phrase révèle, une fois la réponse déjà entendue."""
+    client.fake_llm.responses = ["That sounds fun."]
+    done = next(
+        data
+        for name, data in parse_sse(
+            client.post("/api/chat/turn/stream",
+                        json={"text": "Yesterday I go to the cinema"}).text
+        )
+        if name == "done"
+    )
+
+    client.fake_llm.responses = [TURN_JSON]
+    analysis = client.post(
+        "/api/analyse",
+        json={"text": done["analyse_text"], "session_id": done["session_id"]},
+    ).json()
+
+    assert analysis["correction"]["corrected"] == "Yesterday I went to the cinema"
+    assert analysis["errors"][0]["topic"] == "past_simple"
+
+
+def test_the_analysis_prompt_does_not_carry_the_conversation(client) -> None:
+    """Corriger une phrase n'a besoin ni du mode, ni de la personnalité, ni de
+    l'historique. S'en passer fait tomber le prompt de ~900 à ~250 tokens."""
+    client.fake_llm.responses = ["Fine."]
+    done = next(
+        data
+        for name, data in parse_sse(
+            client.post("/api/chat/turn/stream", json={"text": "I go there"}).text
+        )
+        if name == "done"
+    )
+
+    client.fake_llm.responses = [TURN_JSON]
+    client.post("/api/analyse",
+                json={"text": done["analyse_text"], "session_id": done["session_id"]})
+
+    system = client.fake_llm.calls[-1][0]["content"]
+    assert "Session mode" not in system
+    assert "## Output format" not in system
+    assert len(client.fake_llm.calls[-1]) == 2      # système + la seule phrase
 
 
 def test_chat_stream_audio_chunks_carry_their_sentence(client) -> None:
@@ -273,12 +336,12 @@ def test_chat_stream_without_voice_emits_no_audio(client) -> None:
     assert kinds(events)[-1] == "done"
 
 
-def test_chat_stream_survives_plain_text_answers(client) -> None:
-    client.fake_llm.responses = ["I am simply not going to produce any JSON today, sorry."]
+def test_chat_stream_speaks_plain_text_as_it_comes(client) -> None:
+    """Le premier temps ne demande plus de JSON : le texte brut EST la réponse."""
+    client.fake_llm.responses = ["I am simply going to talk, like a person does."]
     events = parse_sse(client.post("/api/chat/turn/stream", json={"text": "Hi"}).text)
     done = next(data for name, data in events if name == "done")
-    assert done["response"].startswith("I am simply not going")
-    assert done["structured"] is False
+    assert done["response"] == "I am simply going to talk, like a person does."
 
 
 def test_chat_stream_reports_a_command(client) -> None:
@@ -378,7 +441,7 @@ def test_an_unexpected_failure_still_closes_the_stream_with_an_error(client, mon
     def _boom(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
         raise RuntimeError("something nobody predicted")
 
-    monkeypatch.setattr("app.api.routes.tutor.respond_stream", _boom)
+    monkeypatch.setattr("app.api.routes.tutor.reply_stream", _boom)
     response = client.post("/api/chat/turn/stream", json={"text": "Hi"})
     events = parse_sse(response.text)
 
@@ -464,3 +527,79 @@ def test_default_stt_provider_streams_a_single_final_event(client) -> None:
     assert len(events) == 1
     assert events[0].is_final is True
     assert events[0].transcription is not None
+
+
+# --------------------------------------------------------- ecoute permanente
+def test_speech_without_the_wake_word_never_reaches_the_model(client) -> None:
+    """C'est tout l'interet du filtre : transcrire est bon marche, generer non."""
+    client.fake_stt.text = "Yesterday I go to the cinema."
+    client.fake_llm.responses = [TURN_JSON]
+    before = len(client.fake_llm.calls)
+
+    events = parse_sse(
+        client.post(
+            "/api/voice/turn/stream",
+            files={"audio": ("t.webm", b"fake-audio" * 100, "audio/webm")},
+            data={"require_wake_word": "true"},
+        ).text
+    )
+
+    assert "ignored" in kinds(events)
+    assert "delta" not in kinds(events)
+    assert len(client.fake_llm.calls) == before      # le modele n'a pas ete appele
+
+
+def test_calling_her_by_name_starts_a_normal_turn(client) -> None:
+    client.fake_stt.text = "Liliana, yesterday I go to the cinema."
+    client.fake_llm.responses = [TURN_JSON]
+
+    events = parse_sse(
+        client.post(
+            "/api/voice/turn/stream",
+            files={"audio": ("t.webm", b"fake-audio" * 100, "audio/webm")},
+            data={"require_wake_word": "true"},
+        ).text
+    )
+    names = kinds(events)
+
+    assert "awake" in names
+    assert names[-1] == "done"
+    # Le nom est retire : c'est la phrase seule qui est corrigee.
+    awake = next(data for name, data in events if name == "awake")
+    assert awake["text"] == "yesterday I go to the cinema"
+    assert "Liliana" not in client.fake_llm.calls[-1][-1]["content"]
+
+
+def test_her_name_alone_gets_an_invitation_not_a_correction(client) -> None:
+    """« Liliana ? » n'est pas une prise de parole en langue etrangere."""
+    client.fake_stt.text = "Liliana?"
+    before = len(client.fake_llm.calls)
+
+    events = parse_sse(
+        client.post(
+            "/api/voice/turn/stream",
+            files={"audio": ("t.webm", b"fake-audio" * 100, "audio/webm")},
+            data={"require_wake_word": "true", "language": "english"},
+        ).text
+    )
+
+    done = next(data for name, data in events if name == "done")
+    assert done["acknowledgement"] is True
+    assert done["response"]
+    assert done["correction"] is None
+    assert len(client.fake_llm.calls) == before
+
+
+def test_without_the_flag_every_utterance_is_answered(client) -> None:
+    """Le bouton « Speak » reste un ordre explicite : pas de nom a prononcer."""
+    client.fake_stt.text = "Yesterday I go to the cinema."
+    client.fake_llm.responses = [TURN_JSON]
+
+    events = parse_sse(
+        client.post(
+            "/api/voice/turn/stream",
+            files={"audio": ("t.webm", b"fake-audio" * 100, "audio/webm")},
+        ).text
+    )
+    assert "ignored" not in kinds(events)
+    assert kinds(events)[-1] == "done"

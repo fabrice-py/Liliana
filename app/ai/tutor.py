@@ -16,8 +16,12 @@ from typing import Any
 
 from app.ai.llm import LLMProvider, get_llm_provider
 from app.ai.prompts import (
+    ANALYSIS_SCHEMA,
+    DEFAULT_MODE,
     TURN_RESPONSE_SCHEMA,
     TutorContext,
+    build_analysis_prompt,
+    build_reply_prompt,
     build_turn_prompt,
     get_mode,
 )
@@ -246,6 +250,134 @@ class Tutor:
             level=str(profile.get("level") or "A1"),
         )
 
+    # ------------------------------------------------- tour en deux temps
+    def reply_stream(
+        self,
+        *,
+        user_id: int,
+        session_id: int,
+        text: str,
+        language: str,
+        mode: str,
+        correction_mode: str | None = None,
+        is_voice: bool = False,
+        duration_seconds: int = 0,
+    ) -> Iterator[TurnEvent]:
+        """Premier temps : la phrase que Liliana prononce, et rien d'autre.
+
+        Ne demande au modèle que du texte parlé — une quinzaine de tokens au lieu
+        de cent quatre-vingts. C'est ce qui fait tomber le délai avant de
+        l'entendre de cinquante secondes à trois. L'analyse pédagogique suit,
+        séparément, par :meth:`analyse`.
+        """
+        text = (text or "").strip()
+        if not text:
+            raise LLMError(
+                "empty user turn",
+                user_message="Liliana did not receive anything to answer.",
+            )
+        if not is_supported(language):
+            language = get_settings().default_language
+
+        context = self.build_context(user_id, language, mode, correction_mode)
+        history = self._history(session_id)
+        message_repo.add(session_id, "user", text, language, is_voice)
+
+        conversation = [
+            {"role": "system", "content": build_reply_prompt(context)},
+            *history,
+            {"role": "user", "content": text},
+        ]
+
+        sentences = SentenceBuffer()
+        spoken = ""
+        for chunk in self.llm.stream(
+            conversation, model=get_settings().llm_model_for(language)
+        ):
+            if not chunk:
+                continue
+            spoken += chunk
+            yield TurnEvent(kind="delta", text=chunk)
+            for sentence in sentences.feed(chunk):
+                yield TurnEvent(kind="sentence", text=sentence)
+        if remainder := sentences.flush():
+            yield TurnEvent(kind="sentence", text=remainder)
+
+        spoken = spoken.strip()
+        if not is_meaningful_response(spoken):
+            raise LLMError(
+                "model returned nothing usable",
+                user_message="Liliana could not produce an answer. Please try again.",
+            )
+
+        message_repo.add(session_id, "assistant", spoken, language)
+        session_repo.touch(session_id, messages=1)
+        progress_tracker.record_turn(user_id, language, seconds=duration_seconds)
+
+        profile = language_profiles.get_or_create(user_id, language)
+        yield TurnEvent(
+            kind="done",
+            result=TurnResult(
+                response=spoken,
+                session_id=session_id,
+                detected_language=language,
+                structured=True,
+                level=str(profile.get("level") or "A1"),
+            ),
+        )
+
+    def analyse(
+        self,
+        *,
+        user_id: int,
+        session_id: int,
+        text: str,
+        language: str,
+        correction_mode: str | None = None,
+        is_voice: bool = False,
+    ) -> dict[str, Any]:
+        """Second temps : ce que la phrase de l'apprenant révèle.
+
+        Tourne en arrière-plan, une fois la réponse déjà entendue. Le prompt ne
+        reprend ni la personnalité de Liliana, ni le mode, ni l'historique : rien
+        de tout cela ne sert à corriger une phrase.
+        """
+        text = (text or "").strip()
+        if not text:
+            return {"correction": None, "errors": [], "vocabulary": [], "level": ""}
+        if not is_supported(language):
+            language = get_settings().default_language
+
+        context = self.build_context(user_id, language, DEFAULT_MODE, correction_mode)
+        raw = self.llm.generate(
+            [
+                {"role": "system", "content": build_analysis_prompt(context)},
+                {"role": "user", "content": text},
+            ],
+            json_mode=True,
+            schema=ANALYSIS_SCHEMA,
+            model=get_settings().llm_model_for(language),
+        )
+        turn = normalise_turn(extract_json(raw), fallback_text="")
+        # Une « correction » qui change de personne n'en est pas une : un petit
+        # modèle répond parfois « you went » à « I go ».
+        correction = turn["correction"]
+        if correction and not correction.get("original"):
+            correction["original"] = text
+
+        self._persist_learning(
+            user_id, session_id, language, turn,
+            duration_seconds=0, is_voice=is_voice, counts_as_a_turn=False,
+        )
+        profile = progress_tracker.refresh(user_id, language)
+        return {
+            "correction": correction,
+            "errors": turn["errors"],
+            "vocabulary": turn["vocabulary"],
+            "difficulty": turn["difficulty"],
+            "level": str(profile.get("level") or "A1"),
+        }
+
     def respond(
         self,
         *,
@@ -258,7 +390,14 @@ class Tutor:
         is_voice: bool = False,
         duration_seconds: int = 0,
     ) -> TurnResult:
-        """Traite un tour de parole et met à jour la mémoire de Liliana."""
+        """Traite un tour de parole et met à jour la mémoire de Liliana.
+
+        Chemin de repli, en un seul appel : il porte tout le tour d'un coup, ce
+        qui reste le plus simple quand le streaming a échoué et qu'on ne peut
+        de toute façon rien afficher avant la fin. Le chemin normal, lui, passe
+        par :meth:`reply_stream` puis :meth:`analyse` pour rendre la parole sans
+        attendre l'analyse.
+        """
         language, conversation = self._prepare(
             user_id=user_id, session_id=session_id, text=text, language=language,
             mode=mode, correction_mode=correction_mode, is_voice=is_voice,
@@ -342,8 +481,14 @@ class Tutor:
         turn: dict[str, Any],
         duration_seconds: int,
         is_voice: bool = False,
+        counts_as_a_turn: bool = True,
     ) -> None:
-        """Enregistre erreurs, vocabulaire, planning de révision et statistiques."""
+        """Enregistre erreurs, vocabulaire, planning de révision et statistiques.
+
+        ``counts_as_a_turn`` vaut False quand la conversation a déjà été comptée :
+        en deux temps, la réponse compte le tour, l'analyse n'ajoute que ce
+        qu'elle a trouvé. Sans cela, chaque échange compterait double.
+        """
         allowed = set(get_language(language).error_types)
         recorded_errors = [
             error for error in turn["errors"] if error.get("topic") or error.get("type")
@@ -366,13 +511,18 @@ class Tutor:
         )
         spaced_repetition.register_many(user_id, language, "vocabulary", added_words)
 
-        session_repo.touch(session_id, messages=1, errors=len(recorded_errors))
+        session_repo.touch(
+            session_id,
+            messages=1 if counts_as_a_turn else 0,
+            errors=len(recorded_errors),
+        )
         progress_tracker.record_turn(
             user_id,
             language,
             seconds=duration_seconds,
             errors_found=len(recorded_errors),
             words_learned=len(added_words),
+            counts_as_a_turn=counts_as_a_turn,
         )
 
 
