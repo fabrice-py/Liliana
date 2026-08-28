@@ -544,3 +544,27 @@ def test_pronunciation_words_carry_their_confidence(client) -> None:
     recognised = [word for word in payload["words"] if word["ok"]]
     assert recognised
     assert all(word["confidence"] == 0.4 for word in recognised)
+
+
+# ------------------------------------------------------- fraicheur du client
+def test_the_page_versions_its_own_assets(client) -> None:
+    """Un `app.js` peri me en cache est la panne la plus deroutante qui soit.
+
+    Tout parait fonctionner : le serveur repond, la conversation avance, et
+    seules certaines fonctions manquent — celles que l'ancien code ignore.
+    Coller l'empreinte des fichiers a leur URL force le navigateur a se mettre a
+    jour de lui-meme, sans avoir a demander un rechargement force.
+    """
+    html = client.get("/").text
+
+    assert "/static/app.js?v=" in html
+    assert "/static/style.css?v=" in html
+
+
+def test_the_version_only_changes_when_the_files_do(client, tmp_path) -> None:
+    """Sinon on reinvaliderait le cache a chaque demarrage, pour rien."""
+    from app.main import _asset_fingerprint
+
+    first = _asset_fingerprint()
+    assert first == _asset_fingerprint()
+    assert first.count("-") == 1        # une empreinte par fichier suivi

@@ -9,7 +9,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router
@@ -44,6 +44,31 @@ async def lifespan(_: FastAPI):
     logger.info("%s s'arrête.", settings.app_name)
 
 
+def _asset_fingerprint() -> str:
+    """Empreinte des fichiers de l'interface, d'après leur date de modification."""
+    stamps = []
+    for name in ("app.js", "style.css"):
+        path = FRONTEND_DIR / name
+        stamps.append(str(int(path.stat().st_mtime)) if path.is_file() else "0")
+    return "-".join(stamps)
+
+
+def _index_html() -> str:
+    """Page d'accueil, avec les fichiers statiques versionnés.
+
+    Sans cela le navigateur garde en cache un ``app.js`` périmé et l'application
+    tourne avec du code ancien face à une API récente — panne d'autant plus
+    déroutante que tout paraît fonctionner. Coller l'empreinte des fichiers à
+    l'URL force le rechargement dès qu'ils changent, et seulement dans ce cas.
+    """
+    html = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
+    stamp = _asset_fingerprint()
+    return (
+        html.replace('/static/app.js"', f'/static/app.js?v={stamp}"')
+        .replace('/static/style.css"', f'/static/style.css?v={stamp}"')
+    )
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     application = FastAPI(
@@ -71,8 +96,8 @@ def create_app() -> FastAPI:
         )
 
         @application.get("/", include_in_schema=False)
-        async def index() -> FileResponse:
-            return FileResponse(FRONTEND_DIR / "index.html")
+        async def index() -> HTMLResponse:
+            return HTMLResponse(_index_html())
 
         @application.get("/favicon.ico", include_in_schema=False, response_model=None)
         async def favicon() -> FileResponse | JSONResponse:
